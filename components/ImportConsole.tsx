@@ -54,6 +54,12 @@ export function ImportConsole() {
 
   const parsingActive = busy && parseProgress && !progress;
 
+  const parseStageLabel = parseProgress?.stage === "READING"
+    ? "Reading workbook"
+    : parseProgress?.stage === "DECODING"
+      ? "Decoding workbook in background"
+      : `Parsing ${parseProgress?.sheet ?? "source data"}`;
+
   return (
     <div className="stack">
       <section className="panel intake-panel">
@@ -78,11 +84,11 @@ export function ImportConsole() {
       {parsingActive ? (
         <section className="panel progress-panel">
           <div className="progress-head">
-            <strong>{parseProgress.stage === "READING" ? "Reading workbook" : `Parsing ${parseProgress.sheet ?? "source data"}`}</strong>
+            <strong>{parseStageLabel}</strong>
             <span>{parseProgress.percent}%</span>
           </div>
           <div className="progress-track"><div style={{ width: `${parseProgress.percent}%` }} /></div>
-          <p>Large worksheets are processed in browser-friendly slices. Do not close this tab.</p>
+          <p>Excel decoding and parsing run in a background worker. The page should remain responsive while large worksheets are processed.</p>
         </section>
       ) : null}
 
