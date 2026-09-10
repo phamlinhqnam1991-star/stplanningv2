@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { parseWorkbook } from "@/lib/excel-parser";
+import { parseWorkbook, type ParseProgress } from "@/lib/excel-parser";
 import { importWorkbook, type ImportProgress } from "@/lib/import-client";
 import type { ParsedWorkbook } from "@/lib/types";
 
@@ -10,6 +10,7 @@ export function ImportConsole() {
   const [parsed, setParsed] = useState<ParsedWorkbook | null>(null);
   const [sha256, setSha256] = useState("");
   const [busy, setBusy] = useState(false);
+  const [parseProgress, setParseProgress] = useState<ParseProgress | null>(null);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [error, setError] = useState("");
   const [complete, setComplete] = useState(false);
@@ -17,11 +18,15 @@ export function ImportConsole() {
   async function chooseFile(file: File | null) {
     if (!file) return;
     setBusy(true);
+    setParsed(null);
+    setSha256("");
     setError("");
     setComplete(false);
     setProgress(null);
+    setParseProgress({ stage: "READING", percent: 0 });
+
     try {
-      const result = await parseWorkbook(file);
+      const result = await parseWorkbook(file, setParseProgress);
       setParsed(result.workbook);
       setSha256(result.sha256);
     } catch (e) {
@@ -47,6 +52,8 @@ export function ImportConsole() {
     }
   }
 
+  const parsingActive = busy && parseProgress && !progress;
+
   return (
     <div className="stack">
       <section className="panel intake-panel">
@@ -57,8 +64,8 @@ export function ImportConsole() {
         <div className="intake-grid">
           <label className="file-zone">
             <input type="file" accept=".xlsx,.xlsm" disabled={busy} onChange={(e) => chooseFile(e.target.files?.[0] ?? null)} />
-            <strong>{parsed?.filename ?? "Select ST workbook"}</strong>
-            <span>Browser parsing preserves the full used range before data is transferred in safe chunks.</span>
+            <strong>{parsed?.filename ?? (busy ? "Reading workbook…" : "Select ST workbook")}</strong>
+            <span>Browser parsing preserves the complete used range while keeping the page responsive.</span>
           </label>
           <div className="policy-box">
             <div><span>RAW RETENTION</span><strong>100%</strong></div>
@@ -67,6 +74,17 @@ export function ImportConsole() {
           </div>
         </div>
       </section>
+
+      {parsingActive ? (
+        <section className="panel progress-panel">
+          <div className="progress-head">
+            <strong>{parseProgress.stage === "READING" ? "Reading workbook" : `Parsing ${parseProgress.sheet ?? "source data"}`}</strong>
+            <span>{parseProgress.percent}%</span>
+          </div>
+          <div className="progress-track"><div style={{ width: `${parseProgress.percent}%` }} /></div>
+          <p>Large worksheets are processed in browser-friendly slices. Do not close this tab.</p>
+        </section>
+      ) : null}
 
       {parsed ? (
         <section className="panel">

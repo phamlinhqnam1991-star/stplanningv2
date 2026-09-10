@@ -24,6 +24,21 @@ Create a new Aiven PostgreSQL service/database, then run:
 
 ```sql
 -- db/schema.sql
+
+### Aiven SQL execution order (max 8 statements per run)
+
+Run the database scripts **one file at a time** in this exact order:
+
+```text
+db/01_core_raw.sql      # 7 statements
+db/02_planning.sql      # 8 statements
+db/03_scheduling.sql    # 7 statements
+db/04_views.sql         # 3 statements
+db/verify.sql           # 6 SELECT statements, optional after import
+```
+
+`db/schema.sql` is now only a pointer/instruction file and should not be executed as the full schema.
+
 ```
 
 You can use Aiven Query Editor, psql, DBeaver, pgAdmin, or another PostgreSQL client.
