@@ -16,6 +16,7 @@ const nav = [
   { href: "/configuration/recipe-model", code: "CFG-92", label: "Recipe & Process Time" },
   { href: "/configuration/batch-model", code: "CFG-93", label: "Batch Model" },
   { href: "/configuration/output-model", code: "CFG-94", label: "ST Output Model" },
+  { href: "/configuration/capacity-model", code: "CFG-95", label: "Finite Capacity Model" },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -45,8 +46,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v015</strong>
-            <small>ST Output Target Engine</small>
+            <strong>Clean Rebuild v016</strong>
+            <small>Finite Capacity Target Scheduler</small>
           </div>
         </div>
       </aside>

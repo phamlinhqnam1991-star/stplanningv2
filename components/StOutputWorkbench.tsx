@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiJson } from "@/lib/api-client";
+import { FiniteCapacityPanel } from "@/components/FiniteCapacityPanel";
 
 type Step = {
   routePosition:number; operationCode:string; operationSequence:number|null;
@@ -80,6 +81,8 @@ export function StOutputWorkbench(){
       <div className="panel-head"><div><span className="eyebrow">TARGET COVERAGE</span><h2>ST Output Forecast Before {cutoffTime}</h2></div><span className={`state-pill ${s?.remainingGap===0?"good":"review"}`}>{s?.remainingGap===0?"TARGET COVERED":"PLAN REQUIRED"}</span></div>
       <div className="output-progress-body"><div className="output-progress-track"><div style={{width:`${achievement}%`}}/></div><div className="output-progress-labels"><span>0</span><strong>{fmt(s?.forecastWithRecommendation,1)} / {fmt(data?.targetValue,1)} dm²</strong><span>{fmt(data?.targetValue,1)}</span></div></div>
     </section>
+
+    <FiniteCapacityPanel targetDate={targetDate} cutoffTime={cutoffTime} targetValue={Math.max(0,Number(targetValue)||0)} />
 
     <section className="panel">
       <div className="panel-head"><div><span className="eyebrow">BACKWARD REQUIREMENT</span><h2>Recommended Plan by Area / Operation / Recipe</h2></div><span className="record-count"><strong>{data?.actionGroups.length||0}</strong> action groups</span></div>
