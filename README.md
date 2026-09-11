@@ -130,3 +130,15 @@ Configuration is now the extension layer for source mappings, Main Operations, o
 ## v011 — Planning Model
 
 After v010, run `db/10_planning_model_config.sql`, then open `/configuration/planning-model` to create Main Operations and map imported operations. See `README_v011.md` and `docs/PLANNING_MODEL_CONFIG.md`.
+
+
+## v012 — Seeded Configuration Baseline
+
+Run after v011:
+1. `db/11_seed_hierarchy_masters.sql`
+2. `db/12_seed_hierarchy_links.sql`
+3. `db/13_seed_operation_masters.sql`
+4. `db/14_seed_operation_mappings.sql`
+5. Optional: `db/verify_v012_seed.sql`
+
+Review workbook: `docs/ST_Planning_v012_Configuration_Review.xlsx`.

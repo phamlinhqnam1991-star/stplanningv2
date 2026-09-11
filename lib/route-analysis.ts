@@ -39,7 +39,10 @@ export function parseStScope(allOperation: string | null | undefined): string[] 
   const out: string[] = [];
   const seen = new Set<string>();
   for (const token of allOperation.split("|")) {
-    const code = token.trim();
+    const raw = token.trim();
+    if (!raw) continue;
+    const bracketed = /^\[([^\]]+)\]/.exec(raw);
+    const code = (bracketed?.[1] || raw.split("»", 1)[0] || "").trim();
     if (!code) continue;
     const key = norm(code);
     if (!key || seen.has(key)) continue;
