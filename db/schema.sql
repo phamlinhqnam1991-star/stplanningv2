@@ -1,4 +1,4 @@
--- ST Planning Clean Rebuild v015 — ST Output Target Engine
+-- ST Planning Clean Rebuild v017 — Full Parameter Baseline
 -- Aiven Query Editor: maximum 8 statements per execution.
 -- This file is an instruction index only. Run each numbered SQL file separately.
 --
@@ -33,3 +33,14 @@
 --
 -- ST Output verification:
 -- verify_v015_st_output.sql           : 6 queries
+
+-- v016 / v017 additions:
+-- 25_finite_capacity_config.sql        : 5 statements
+-- 26_process_time_engine_v017.sql      : 6 statements
+-- 27_process_time_baseline_v017.sql    : 1 statement
+-- 28_batch_capacity_baseline_v017.sql  : 3 statements
+-- 29_capacity_baseline_v017.sql        : 4 statements
+-- 30_output_precision_v017.sql         : 3 statements
+--
+-- Upgrade from v016: run only 26 -> 30.
+-- v017 verification: verify_v017_parameters.sql : 6 queries

@@ -151,7 +151,7 @@ export function RecipeModelConsole() {
 
   return <div className="stack recipe-model-console">
     <section className="panel recipe-model-hero">
-      <div><span className="eyebrow">CFG-92 · RECIPE & TIME ENGINE</span><h2>Recipe / Process Time Workbench</h2><p>Recipe No., Recipe Name, source selectors, Recipe Rules, fixed process times and future Qty/Surface process-time rules are configuration data. Source gaps stay visible for review.</p></div>
+      <div><span className="eyebrow">CFG-92 · RECIPE & TIME ENGINE</span><h2>Recipe / Process Time Workbench</h2><p>v017 activates a complete editable timing baseline: source/recipe time first, operation standards second, and conservative Main Operation fallback last. Masking/unmasking source standards are treated as minutes per piece; Qty/Surface tiers are active for paint.</p></div>
       <div className="config-principles"><span>RECIPE MASTER</span><span>RULE DRIVEN</span><span>TIME CONFIG</span></div>
     </section>
 

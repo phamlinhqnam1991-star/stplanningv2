@@ -93,6 +93,12 @@ export type ProcessTimeSuggestion = {
   details?: JsonMap;
 };
 
+export type ProcessTimeContext = {
+  operationCode?: string | null;
+  qty?: number | null;
+  surfaceDm2?: number | null;
+};
+
 function record(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonMap : {};
 }
@@ -118,6 +124,9 @@ function normName(value: unknown): string {
 }
 function arrayStrings(value: unknown): string[] {
   return Array.isArray(value) ? value.map(str).map((x) => x.trim()).filter(Boolean) : [];
+}
+function setting<T>(settings: Record<string, unknown>, name: string, fallback: T): T {
+  return Object.prototype.hasOwnProperty.call(settings, name) ? settings[name] as T : fallback;
 }
 function rawValue(rawRow: unknown, excelColumn: string): unknown {
   const row = record(rawRow);
@@ -307,7 +316,8 @@ export function resolveRecipe(mainOperationCode: string | null, rawRow: unknown,
     const code = str(action.recipeNo);
     const recipe = model.recipeByCode.get(key(code));
     if (recipe) return suggestionFromRecipe(recipe, rule, null, code, action);
-    return { status:"SOURCE_ONLY", ruleCode:rule.code, selector, recipeNo:code || null, recipeName:null, recipeGroup:null, sourceField:null, sourceColumn:null, sourceValue:code || null, confidence:str(action.confidence)||null, needsReview:true, candidates:[] };
+    const acceptSourceOnly = bool(setting(model.settings, "recipeModel.acceptSourceOnlyRecipeCodes", false), false);
+    return { status:"SOURCE_ONLY", ruleCode:rule.code, selector, recipeNo:code || null, recipeName:null, recipeGroup:null, sourceField:null, sourceColumn:null, sourceValue:code || null, confidence:str(action.confidence)||"BASELINE_AUTO", needsReview:!acceptSourceOnly, candidates:[] };
   }
 
   if (selector === "SOURCE_IDENTIFIER") {
@@ -335,15 +345,28 @@ export function resolveRecipe(mainOperationCode: string | null, rawRow: unknown,
   if (selector === "SOURCE_NAME") {
     const matches = candidatesForName(model, selected.text);
     if (matches.length === 1) return suggestionFromRecipe(matches[0], rule, selected.field, selected.text, action);
-    if (matches.length > 1) return {
-      status:"AMBIGUOUS", ruleCode:rule.code, selector, recipeNo:null, recipeName:selected.text, recipeGroup:null,
-      sourceField:selected.field?.code||null, sourceColumn:selected.field?.sourceColumn||null, sourceValue:selected.text,
-      confidence:str(action.confidence)||null, needsReview:true, candidates:matches.map((x)=>({code:x.code,label:x.label})),
-    };
+    if (matches.length > 1) {
+      const policy = key(setting(model.settings, "recipeModel.ambiguousNamePolicy", "REVIEW"));
+      if (policy === "LOWEST_RECIPE_NO") {
+        const chosen = [...matches].sort((a,b)=>{
+          const an=Number(a.recipeNo), bn=Number(b.recipeNo);
+          if (Number.isFinite(an) && Number.isFinite(bn) && an!==bn) return an-bn;
+          return a.recipeNo.localeCompare(b.recipeNo, undefined, { numeric:true, sensitivity:"base" });
+        })[0];
+        const out = suggestionFromRecipe(chosen, rule, selected.field, selected.text, action);
+        return { ...out, status:"MATCHED", needsReview:false, confidence:"BASELINE_AUTO", candidates:matches.map((x)=>({code:x.code,label:x.label})) };
+      }
+      return {
+        status:"AMBIGUOUS", ruleCode:rule.code, selector, recipeNo:null, recipeName:selected.text, recipeGroup:null,
+        sourceField:selected.field?.code||null, sourceColumn:selected.field?.sourceColumn||null, sourceValue:selected.text,
+        confidence:str(action.confidence)||null, needsReview:true, candidates:matches.map((x)=>({code:x.code,label:x.label})),
+      };
+    }
     const fallback = str(action.fallbackRecipeNo);
     const fallbackRecipe = fallback ? model.recipeByCode.get(key(fallback)) : null;
     if (fallbackRecipe) return suggestionFromRecipe(fallbackRecipe, rule, selected.field, selected.text, action);
-    return { status:"SOURCE_ONLY", ruleCode:rule.code, selector, recipeNo:null, recipeName:selected.text, recipeGroup:null, sourceField:selected.field?.code||null, sourceColumn:selected.field?.sourceColumn||null, sourceValue:selected.text, confidence:str(action.confidence)||null, needsReview:true, candidates:[] };
+    const acceptSourceOnly = bool(setting(model.settings, "recipeModel.acceptSourceOnlyRecipeCodes", false), false);
+    return { status:"SOURCE_ONLY", ruleCode:rule.code, selector, recipeNo:null, recipeName:selected.text, recipeGroup:null, sourceField:selected.field?.code||null, sourceColumn:selected.field?.sourceColumn||null, sourceValue:selected.text, confidence:str(action.confidence)||"BASELINE_AUTO", needsReview:!acceptSourceOnly, candidates:[] };
   }
 
   if (selector === "SOURCE_CODE_LIST") {
@@ -368,10 +391,11 @@ export function resolveRecipe(mainOperationCode: string | null, rawRow: unknown,
     if (secondary.length) resolved.secondaryValues = secondary.map((f) => ({ sourceField:f, sourceValue:sourceText(model,rawRow,f).text })).filter((x)=>x.sourceValue);
     return resolved;
   }
+  const acceptSourceOnly = bool(setting(model.settings, "recipeModel.acceptSourceOnlyRecipeCodes", false), false);
   return {
     status:"SOURCE_ONLY", ruleCode:rule.code, selector, recipeNo:selected.text, recipeName:null, recipeGroup:null,
     sourceField:selected.field?.code||null, sourceColumn:selected.field?.sourceColumn||null, sourceValue:selected.text,
-    confidence:str(action.confidence)||null, needsReview:true, candidates:[],
+    confidence:str(action.confidence)||"BASELINE_AUTO", needsReview:!acceptSourceOnly, candidates:[],
   };
 }
 
@@ -379,34 +403,195 @@ export function resolveProcessTime(
   mainOperationCode: string | null,
   rawRow: unknown,
   recipe: RecipeSuggestion,
-  model: RecipeModel
+  model: RecipeModel,
+  context: ProcessTimeContext = {},
 ): ProcessTimeSuggestion {
-  const explicit = model.processTimeRules
-    .filter((r) => r.enabled && matchesMain(r.condition, mainOperationCode) && str(r.action.mode) !== "RECIPE_DEFAULT_MINUTES")
-    .sort((a,b)=>a.priority-b.priority || a.code.localeCompare(b.code));
-  for (const rule of explicit) {
+  const operationCode = key(context.operationCode);
+  const qty = Math.max(0, num(context.qty) ?? 0);
+  const surfaceDm2 = Math.max(0, num(context.surfaceDm2) ?? 0);
+
+  const conditionMatches = (condition: JsonMap) => {
+    if (!matchesMain(condition, mainOperationCode)) return false;
+    const exactOperation = key(condition.operationCode);
+    if (exactOperation && exactOperation !== operationCode) return false;
+    const operationList = arrayStrings(condition.operationCodeIn).map(key);
+    if (operationList.length && !operationList.includes(operationCode)) return false;
+    return true;
+  };
+
+  const minutesFromUnit = (value: number, unit: string) => {
+    const u = key(unit);
+    if (u === "HOUR" || u === "HOURS" || u === "HR" || u === "H") return value * 60;
+    return value;
+  };
+
+  const resolved = (rule: RecipeConfigRule, mode: string, minutes: number, extra: JsonMap = {}): ProcessTimeSuggestion => ({
+    status: "RESOLVED",
+    ruleCode: rule.code,
+    mode,
+    minutes: Math.max(0, Math.round(minutes * 100) / 100),
+    unit: "MINUTE",
+    sourceField: str(extra.sourceField) || null,
+    sourceValue: str(extra.sourceValue) || null,
+    profile: str(rule.action.profile) || null,
+    needsReview: bool(rule.action.needsReview, false),
+    details: { ...extra, assumption: bool(rule.action.assumption, false), sourceBasis: str(rule.action.sourceBasis) || undefined },
+  });
+
+  const evaluate = (rule: RecipeConfigRule): ProcessTimeSuggestion | null => {
     const action = rule.action;
-    const mode = str(action.mode);
+    const mode = key(action.mode);
     if (mode === "SOURCE_COLUMN") {
       const fieldCode = str(action.sourceField);
       const src = sourceText(model, rawRow, fieldCode);
-      const minutes = num(src.text);
-      if (minutes == null) continue;
-      return {
-        status:"RESOLVED", ruleCode:rule.code, mode, minutes,
-        unit:str(action.unit)||src.field?.unit||null, sourceField:src.field?.code||fieldCode||null,
-        sourceValue:src.text||null, profile:str(action.profile)||null, needsReview:bool(action.needsReview,false)||Boolean(src.field?.needsReview),
+      const value = num(src.text);
+      if (value == null) return null;
+      const minutes = minutesFromUnit(value, str(action.unit) || src.field?.unit || "MINUTE");
+      return resolved(rule, mode, minutes, { sourceField: src.field?.code || fieldCode, sourceValue: src.text, rawValue: value });
+    }
+    if (mode === "SOURCE_BATCH_MINUTES") {
+      const fieldCode = str(action.sourceField);
+      const batchSizeField = str(action.batchSizeField);
+      const src = sourceText(model, rawRow, fieldCode);
+      const batchSrc = batchSizeField ? sourceText(model, rawRow, batchSizeField) : { field: null, text: "" };
+      const perBatch = num(src.text);
+      if (perBatch == null) return null;
+      const batchSize = Math.max(1, num(batchSrc.text) ?? (qty || 1));
+      const cycles = Math.max(1, Math.ceil((qty || batchSize) / batchSize));
+      const minutes = minutesFromUnit(perBatch, str(action.unit) || src.field?.unit || "MINUTE") * cycles;
+      return resolved(rule, mode, minutes, { sourceField: src.field?.code || fieldCode, sourceValue: src.text, batchSizeField: batchSrc.field?.code || batchSizeField, batchSize, cycles });
+    }
+    if (mode === "SOURCE_MINUTES_PER_PIECE" || mode === "SOURCE_MINUTES_PER_PIECE_FIELDS") {
+      const fields = arrayStrings(action.sourceFields);
+      if (!fields.length && str(action.sourceField)) fields.push(str(action.sourceField));
+      const values = fields.map((fieldCode) => {
+        const src = sourceText(model, rawRow, fieldCode);
+        return { fieldCode, src, value: num(src.text) };
+      }).filter((x) => x.value != null) as Array<{ fieldCode: string; src: { field: SourceFieldDefinition | null; text: string }; value: number }>;
+      let standard = values[0] || null;
+      if (values.length > 1) {
+        const selector = key(action.sourceValueSelector) || "MAX";
+        if (selector === "MIN") standard = values.reduce((a,b)=>a.value<=b.value?a:b);
+        else if (selector === "FIRST") standard = values[0];
+        else if (selector === "AVERAGE") {
+          const average = values.reduce((sum,x)=>sum+x.value,0)/values.length;
+          standard = { fieldCode: values.map(x=>x.fieldCode).join(","), src: { field:null, text:String(average) }, value: average };
+        } else standard = values.reduce((a,b)=>a.value>=b.value?a:b);
+      }
+      let minPerPiece = standard?.value ?? num(action.fallbackMinutesPerPiece);
+      if (minPerPiece == null) return null;
+      const operators = Math.max(1, num(action.operators) ?? 1);
+      const effectiveQty = Math.max(1, qty || num(action.defaultQty) || 1);
+      const setupMinutes = Math.max(0, num(action.setupMinutes) ?? 0);
+      const minutes = setupMinutes + (minPerPiece * effectiveQty) / operators;
+      return resolved(rule, mode, minutes, { sourceField: standard?.src.field?.code || standard?.fieldCode || null, sourceValue: standard?.src.text || String(minPerPiece), minutesPerPiece: minPerPiece, qty: effectiveQty, operators, setupMinutes });
+    }
+    if (mode === "FIXED_MINUTES_PER_PIECE") {
+      const minPerPiece = num(action.minutesPerPiece);
+      if (minPerPiece == null) return null;
+      const operators = Math.max(1, num(action.operators) ?? 1);
+      const effectiveQty = Math.max(1, qty || num(action.defaultQty) || 1);
+      const setupMinutes = Math.max(0, num(action.setupMinutes) ?? 0);
+      return resolved(rule, mode, setupMinutes + (minPerPiece * effectiveQty) / operators, { minutesPerPiece: minPerPiece, qty: effectiveQty, operators, setupMinutes });
+    }
+    if (mode === "SOURCE_QTY_BREAKPOINTS") {
+      const points = (Array.isArray(action.breakpoints) ? action.breakpoints : []).map((entry) => {
+        const item = record(entry);
+        const pointQty = num(item.qty);
+        const fieldCode = str(item.sourceField);
+        const src = fieldCode ? sourceText(model, rawRow, fieldCode) : { field:null, text:"" };
+        const pointMinutes = num(src.text);
+        return pointQty != null && pointMinutes != null ? { qty: pointQty, minutes: pointMinutes, fieldCode, sourceValue: src.text } : null;
+      }).filter((x): x is { qty:number; minutes:number; fieldCode:string; sourceValue:string } => Boolean(x)).sort((a,b)=>a.qty-b.qty);
+      if (!points.length) return null;
+      const batchSizeField = str(action.batchSizeField);
+      const batchSource = batchSizeField ? sourceText(model, rawRow, batchSizeField) : { field:null, text:"" };
+      const configuredBatch = num(batchSource.text);
+      const batchSize = Math.max(1, configuredBatch ?? points[points.length-1].qty);
+      const totalQty = Math.max(1, qty || batchSize);
+      const estimateCycle = (cycleQty: number) => {
+        const upper = points.find((x)=>x.qty>=cycleQty);
+        if (upper) return upper.minutes;
+        const last = points[points.length-1];
+        return last.minutes * Math.max(1, cycleQty / last.qty);
       };
+      let remaining = totalQty;
+      let minutes = 0;
+      let cycles = 0;
+      while (remaining > 0 && cycles < 10000) {
+        const cycleQty = Math.min(batchSize, remaining);
+        minutes += estimateCycle(cycleQty);
+        remaining -= cycleQty;
+        cycles += 1;
+      }
+      return resolved(rule, mode, minutes, { qty: totalQty, batchSize, cycles, availableBreakpoints: points.map(x=>({qty:x.qty,minutes:x.minutes,sourceField:x.fieldCode})) });
+    }
+    if (mode === "RECIPE_PLUS_OVERHEAD") {
+      const recipeDef = recipe.recipeNo ? model.recipeByCode.get(key(recipe.recipeNo)) : null;
+      const recipeMinutes = recipeDef?.defaultProcessTimeMinutes;
+      if (recipeMinutes == null) return null;
+      const tierMinutes = (specRaw: unknown) => {
+        const spec = record(specRaw);
+        const tiers = Array.isArray(spec.tiers) ? spec.tiers.map(record) : [];
+        const tier = tiers.find((x) => {
+          const qtyMin=num(x.qtyMin), qtyMax=num(x.qtyMax), surfaceMin=num(x.surfaceMinDm2), surfaceMax=num(x.surfaceMaxDm2);
+          if (qtyMin!=null && qty<qtyMin) return false;
+          if (qtyMax!=null && qty>qtyMax) return false;
+          if (surfaceMin!=null && surfaceDm2<surfaceMin) return false;
+          if (surfaceMax!=null && surfaceDm2>surfaceMax) return false;
+          return true;
+        });
+        return num(tier?.minutes) ?? num(spec.defaultMinutes) ?? 0;
+      };
+      const loading = tierMinutes(action.loading);
+      const unloading = tierMinutes(action.unloading);
+      const normRecipe = (value: unknown) => {
+        const x=str(value).trim();
+        return /^\d+$/.test(x) ? String(Number(x)) : key(x);
+      };
+      const ndtRecipes = arrayStrings(action.ndtRecipeNos).map(normRecipe);
+      const ndt = ndtRecipes.includes(normRecipe(recipe.recipeNo)) ? Math.max(0, num(action.ndtMinutes) ?? 0) : 0;
+      return resolved(rule, mode, recipeMinutes + loading + unloading + ndt, { recipeMinutes, loadingMinutes:loading, unloadingMinutes:unloading, ndtMinutes:ndt, qty, surfaceDm2, recipeNo:recipe.recipeNo });
+    }
+    if (mode === "QTY_SURFACE_TIERS") {
+      const tiers = Array.isArray(action.tiers) ? action.tiers.map(record) : [];
+      const matches = (tier: JsonMap) => {
+        const qtyMin = num(tier.qtyMin), qtyMax = num(tier.qtyMax), surfaceMin = num(tier.surfaceMinDm2), surfaceMax = num(tier.surfaceMaxDm2);
+        if (qtyMin != null && qty < qtyMin) return false;
+        if (qtyMax != null && qty > qtyMax) return false;
+        if (surfaceMin != null && surfaceDm2 < surfaceMin) return false;
+        if (surfaceMax != null && surfaceDm2 > surfaceMax) return false;
+        return true;
+      };
+      const tier = tiers.find(matches) || null;
+      const minutes = num(tier?.minutes) ?? num(action.defaultMinutes);
+      if (minutes == null) return null;
+      return resolved(rule, mode, minutes, { qty, surfaceDm2, matchedTier: tier || null });
+    }
+    if (mode === "FIXED_MINUTES") {
+      const minutes = num(action.minutes);
+      if (minutes == null) return null;
+      return resolved(rule, mode, minutes, { qty, surfaceDm2 });
     }
     return {
       status:"REVIEW_REQUIRED", ruleCode:rule.code, mode, minutes:null, unit:str(action.unit)||null,
       sourceField:null, sourceValue:null, profile:str(action.profile)||null, needsReview:true, details:action,
     };
+  };
+
+  const matching = model.processTimeRules
+    .filter((r) => r.enabled && conditionMatches(r.condition))
+    .sort((a,b)=>a.priority-b.priority || a.code.localeCompare(b.code));
+
+  const primary = matching.filter((r) => key(r.action.mode) !== "RECIPE_DEFAULT_MINUTES" && !bool(r.action.fallbackOnly, false));
+  for (const rule of primary) {
+    const result = evaluate(rule);
+    if (result) return result;
   }
 
-  const defaultRule = model.processTimeRules
-    .filter((r) => r.enabled && str(r.action.mode) === "RECIPE_DEFAULT_MINUTES")
-    .sort((a,b)=>a.priority-b.priority || a.code.localeCompare(b.code))[0] || null;
+  const defaultRule = matching.find((r) => key(r.action.mode) === "RECIPE_DEFAULT_MINUTES")
+    || model.processTimeRules.filter((r)=>r.enabled && key(r.action.mode)==="RECIPE_DEFAULT_MINUTES").sort((a,b)=>a.priority-b.priority||a.code.localeCompare(b.code))[0]
+    || null;
   if (defaultRule && recipe.recipeNo) {
     const def = model.recipeByCode.get(key(recipe.recipeNo));
     if (def?.defaultProcessTimeMinutes != null) {
@@ -414,8 +599,17 @@ export function resolveProcessTime(
         status:"RESOLVED", ruleCode:defaultRule.code, mode:"RECIPE_DEFAULT_MINUTES",
         minutes:def.defaultProcessTimeMinutes, unit:"MINUTE", sourceField:null, sourceValue:null,
         profile:str(defaultRule.action.profile)||"RECIPE_DEFAULT_FIXED", needsReview:def.needsReview||bool(defaultRule.action.needsReview,false),
+        details:{ sourceBasis:"STRecipe.Duration", assumption:false },
       };
     }
   }
+
+  const fallback = matching.filter((r) => bool(r.action.fallbackOnly, false));
+  for (const rule of fallback) {
+    const result = evaluate(rule);
+    if (result) return result;
+  }
+
   return { status:"NO_RULE", ruleCode:null, mode:null, minutes:null, unit:null, sourceField:null, sourceValue:null, profile:null, needsReview:false };
 }
+

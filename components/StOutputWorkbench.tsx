@@ -65,7 +65,7 @@ export function StOutputWorkbench(){
         <label><span>ST Output Target (dm²)</span><input type="number" min="0" step="100" value={targetValue} onChange={e=>setTargetValue(e.target.value)}/></label>
         <div className="output-command-actions"><button className="button primary" disabled={loading} onClick={()=>void load(false)}>{loading?"Calculating…":"Calculate"}</button><button className="button" disabled={saving} onClick={()=>void saveTarget()}>{saving?"Saving…":"Save Target"}</button></div>
       </div>
-      <div className="output-policy-line"><span>FINAL ST</span><strong>{data?.endpointOperation||"FINSST"}</strong><span>CUTOFF</span><strong>{cutoffTime}</strong><span>ROUTE SNAPSHOT</span><strong>{fmtTime(data?.routeSnapshotAt)}</strong><span>LOGIC</span><strong>NextOperation → Remaining Route → Process Time → FINSST</strong></div>
+      <div className="output-policy-line"><span>FINAL ST</span><strong>{data?.endpointOperation||"FINSST"}</strong><span>CUTOFF</span><strong>{cutoffTime}</strong><span>ROUTE SNAPSHOT</span><strong>{fmtTime(data?.routeSnapshotAt)}</strong><span>LOGIC</span><strong>NextOperation → Every Remaining Step → Recipe / Std Time → Finite Capacity → FINSST</strong></div>
     </section>
 
     <section className="kpi-grid output-kpis">

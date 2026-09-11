@@ -109,8 +109,15 @@ export async function loadCandidateRows(options: LoadOptions = {}): Promise<Cand
       ? classifyOperationRoute(routeAnalysis.remainingStRoute.map((op) => op.code), planningModel)
       : null;
     const nextPlanning = planningClassification?.nextPlanningOperation || null;
+    const nextPlanningSourceOperation = nextPlanning
+      ? planningClassification?.steps.find((step) => step.planningEnabled && step.mainOperationCode === nextPlanning.code)?.sourceOperation || routeAnalysis?.nextStOperation || null
+      : routeAnalysis?.nextStOperation || null;
     const recipe = resolveRecipe(nextPlanning?.code || null, row.raw_row_data, recipeModel);
-    const processTime = resolveProcessTime(nextPlanning?.code || null, row.raw_row_data, recipe, recipeModel);
+    const processTime = resolveProcessTime(nextPlanning?.code || null, row.raw_row_data, recipe, recipeModel, {
+      operationCode: nextPlanningSourceOperation,
+      qty: row.prod_qty == null ? null : Number(row.prod_qty),
+      surfaceDm2: row.surface_dm2 == null ? null : Number(row.surface_dm2),
+    });
     const proposal = resolveBatchProposal({
       planningJobId: Number(row.id), jobNum: String(row.job_num || ""), program: row.program as string | null,
       partCluster: row.part_cluster as string | null, part: row.epicor_part as string | null,

@@ -288,7 +288,11 @@ function assessJob(
     const include = outputModel.includeNonPlanningOperations || Boolean(main?.planningEnabled);
     if (!include) continue;
     const recipe = resolveRecipe(main?.code || null, row.raw_row_data, recipeModel);
-    const process = resolveProcessTime(main?.code || null, row.raw_row_data, recipe, recipeModel);
+    const process = resolveProcessTime(main?.code || null, row.raw_row_data, recipe, recipeModel, {
+      operationCode: op.code,
+      qty: numberOrNull(row.prod_qty),
+      surfaceDm2,
+    });
     const batch = takeBatch(main, queues);
     const batchMinutes = batch?.processTimeMinutes;
     let duration = batchMinutes != null ? batchMinutes : process.minutes;

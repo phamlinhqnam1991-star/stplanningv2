@@ -196,8 +196,15 @@ export async function GET(request: Request) {
       })) || [];
       const nextMain = planningClassification?.nextMainOperation || null;
       const nextPlanning = planningClassification?.nextPlanningOperation || null;
+      const nextPlanningSourceOperation = nextPlanning
+        ? planningClassification?.steps.find((step) => step.planningEnabled && step.mainOperationCode === nextPlanning.code)?.sourceOperation || routeAnalysis?.nextStOperation || null
+        : routeAnalysis?.nextStOperation || null;
       const recipeSuggestion = resolveRecipe(nextPlanning?.code || null, row.raw_row_data, recipeModel);
-      const processTimeSuggestion = resolveProcessTime(nextPlanning?.code || null, row.raw_row_data, recipeSuggestion, recipeModel);
+      const processTimeSuggestion = resolveProcessTime(nextPlanning?.code || null, row.raw_row_data, recipeSuggestion, recipeModel, {
+        operationCode: nextPlanningSourceOperation,
+        qty: row.prod_qty == null ? null : Number(row.prod_qty),
+        surfaceDm2: row.surface_dm2 == null ? null : Number(row.surface_dm2),
+      });
       const { raw_row_data: _rawRowData, ...publicRow } = row;
       return {
         ...publicRow,
