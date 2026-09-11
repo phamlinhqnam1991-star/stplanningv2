@@ -1,4 +1,4 @@
--- ST Planning Clean Rebuild v013 — Recipe + Process Time Model
+-- ST Planning Clean Rebuild v015 — ST Output Target Engine
 -- Aiven Query Editor: maximum 8 statements per execution.
 -- This file is an instruction index only. Run each numbered SQL file separately.
 --
@@ -23,9 +23,13 @@
 -- 18_recipe_rules_seed.sql            : 1 statement
 -- 19_process_time_profiles.sql        : 1 statement
 -- 20_process_time_rules_seed.sql      : 1 statement
+-- 21_batch_core.sql                   : 6 statements
+-- 22_batch_config_seed.sql            : 4 statements
+-- 23_st_output_target.sql             : 3 statements
+-- 24_st_output_config_seed.sql        : 4 statements
 --
--- Upgrade from v012:
--- run only 15 -> 16 -> 17 -> 18 -> 19 -> 20
+-- Upgrade from v014:
+-- run only 23 -> 24
 --
--- Recipe/process verification:
--- verify_v013_recipe.sql               : 6 queries
+-- ST Output verification:
+-- verify_v015_st_output.sql           : 6 queries

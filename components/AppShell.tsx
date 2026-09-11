@@ -8,10 +8,14 @@ const nav = [
   { href: "/import", code: "DATA-01", label: "Data Import" },
   { href: "/routing", code: "ROUTE-05", label: "Job Routing" },
   { href: "/planning", code: "PLAN-10", label: "Planning" },
+  { href: "/batches", code: "BAT-30", label: "Batch Planning" },
+  { href: "/st-output", code: "OUT-40", label: "ST Output Target" },
   { href: "/scheduling", code: "SCH-20", label: "Scheduling" },
   { href: "/configuration", code: "CFG-90", label: "Configuration" },
   { href: "/configuration/planning-model", code: "CFG-91", label: "Planning Model" },
   { href: "/configuration/recipe-model", code: "CFG-92", label: "Recipe & Process Time" },
+  { href: "/configuration/batch-model", code: "CFG-93", label: "Batch Model" },
+  { href: "/configuration/output-model", code: "CFG-94", label: "ST Output Model" },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -41,8 +45,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v013</strong>
-            <small>Recipe + Process Time Model</small>
+            <strong>Clean Rebuild v015</strong>
+            <small>ST Output Target Engine</small>
           </div>
         </div>
       </aside>
