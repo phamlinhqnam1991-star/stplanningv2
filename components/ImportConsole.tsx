@@ -56,9 +56,15 @@ export function ImportConsole() {
 
   const parseStageLabel = parseProgress?.stage === "READING"
     ? "Reading workbook"
-    : parseProgress?.stage === "DECODING"
-      ? "Decoding workbook in background"
-      : `Parsing ${parseProgress?.sheet ?? "source data"}`;
+    : parseProgress?.stage === "LOCATING"
+      ? "Locating workbook data"
+      : parseProgress?.stage === "UNPACKING"
+        ? `Unpacking ${parseProgress.sheet ?? parseProgress.detail ?? "workbook data"}`
+        : parseProgress?.stage === "HASHING"
+          ? "Verifying workbook fingerprint"
+          : parseProgress?.stage === "COMPLETE"
+            ? "Workbook ready"
+            : `Parsing ${parseProgress?.sheet ?? "source data"}`;
 
   return (
     <div className="stack">
@@ -88,7 +94,7 @@ export function ImportConsole() {
             <span>{parseProgress.percent}%</span>
           </div>
           <div className="progress-track"><div style={{ width: `${parseProgress.percent}%` }} /></div>
-          <p>Excel decoding and parsing run in a background worker. The page should remain responsive while large worksheets are processed.</p>
+          <p>The importer reads only the two controlled worksheet XML parts in a background worker. It does not decode unrelated sheets, styles, or workbook objects.</p>
         </section>
       ) : null}
 

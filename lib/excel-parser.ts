@@ -3,8 +3,9 @@
 import type { ParsedWorkbook } from "@/lib/types";
 
 export type ParseProgress = {
-  stage: "READING" | "DECODING" | "PARSING" | "COMPLETE";
+  stage: "READING" | "LOCATING" | "UNPACKING" | "PARSING" | "HASHING" | "COMPLETE";
   sheet?: string;
+  detail?: string;
   percent: number;
 };
 
@@ -37,9 +38,6 @@ export async function parseWorkbook(
   onProgress?.({ stage: "READING", percent: 2 });
   await yieldToBrowser();
 
-  // Reading the file bytes is asynchronous. The expensive XLSX decode/parse is
-  // intentionally moved to a dedicated Web Worker below so it can never block
-  // React or the browser UI thread.
   const buffer = await file.arrayBuffer();
   onProgress?.({ stage: "READING", percent: 8 });
   await yieldToBrowser();
@@ -51,8 +49,12 @@ export async function parseWorkbook(
     });
 
     let settled = false;
+    const watchdog = window.setTimeout(() => {
+      fail("Excel parsing timed out after 120 seconds. The workbook may be damaged or unusually large.");
+    }, 120_000);
 
     const cleanup = () => {
+      window.clearTimeout(watchdog);
       worker.onmessage = null;
       worker.onerror = null;
       worker.onmessageerror = null;
@@ -74,12 +76,10 @@ export async function parseWorkbook(
         onProgress?.(message.progress);
         return;
       }
-
       if (message.type === "ERROR") {
         fail(message.error || "Excel parser worker failed.");
         return;
       }
-
       if (message.type === "DONE") {
         if (settled) return;
         settled = true;
@@ -88,22 +88,9 @@ export async function parseWorkbook(
       }
     };
 
-    worker.onerror = (event) => {
-      fail(event.message || "Excel parser worker crashed.");
-    };
+    worker.onerror = (event) => fail(event.message || "Excel parser worker crashed.");
+    worker.onmessageerror = () => fail("The browser could not transfer parsed Excel data from the worker.");
 
-    worker.onmessageerror = () => {
-      fail("The browser could not transfer parsed Excel data from the worker.");
-    };
-
-    // Transfer ownership instead of copying the 6+ MB workbook buffer.
-    worker.postMessage(
-      {
-        type: "PARSE",
-        filename: file.name,
-        buffer,
-      },
-      [buffer]
-    );
+    worker.postMessage({ type: "PARSE", filename: file.name, buffer }, [buffer]);
   });
 }
