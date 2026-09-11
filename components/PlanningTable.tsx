@@ -212,7 +212,7 @@ export function PlanningTable() {
       case "part": return <><strong>{row.epicor_part || "—"}</strong><small className="subcell">{[row.alloy, row.temper].filter(Boolean).join(" / ")}</small></>;
       case "revision": return row.revision_num || "—";
       case "description": return <span title={row.part_description || ""}>{row.part_description || "—"}</span>;
-      case "job": return <span className="mono">{row.job_num || "—"}</span>;
+      case "job": return row.job_num ? <a className="mono route-link" href={`/routing?search=${encodeURIComponent(row.job_num)}`}>{row.job_num}</a> : <span className="mono">—</span>;
       case "nextOp": return <span className="op-chip">{row.next_operation || "—"}</span>;
       case "lastOp": return row.last_labor_op || "—";
       case "prodQty": return fmt(row.prod_qty);

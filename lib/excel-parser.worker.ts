@@ -1,9 +1,10 @@
-import { SOURCE_SHEETS, excelColumnLetter } from "@/lib/source-model";
-import type { ParsedSheet, ParsedWorkbook, RawCell, RawRow, SourceColumn } from "@/lib/types";
+import { ROUTING_SOURCE, SOURCE_SHEETS, excelColumnLetter } from "@/lib/source-model";
+import type { ParsedRoutingWorkbook, ParsedSheet, ParsedWorkbook, RawCell, RawRow, SourceColumn } from "@/lib/types";
 import type { ParseProgress } from "@/lib/excel-parser";
 
 type ParseRequest = {
   type: "PARSE";
+  mode: "ST" | "ROUTING";
   filename: string;
   buffer: ArrayBuffer;
 };
@@ -15,7 +16,9 @@ type ProgressMessage = {
 
 type DoneMessage = {
   type: "DONE";
-  workbook: ParsedWorkbook;
+  mode: "ST" | "ROUTING";
+  workbook?: ParsedWorkbook;
+  routingWorkbook?: ParsedRoutingWorkbook;
   sha256: string;
 };
 
@@ -36,6 +39,8 @@ type WorkbookSheetRef = {
   name: string;
   relId: string;
 };
+
+type ParseKey = "planning" | "scheduling" | "routing";
 
 const utf8 = new TextDecoder("utf-8");
 
@@ -119,12 +124,8 @@ async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
     throw new Error("This browser does not support native XLSX decompression. Please use a current Chrome or Edge version.");
   }
 
-  // TypeScript 5.9 models Uint8Array with ArrayBufferLike, which may include
-  // SharedArrayBuffer. BlobPart only accepts an ArrayBuffer-backed view.
-  // Make a small owned copy so the Blob input is guaranteed to be ArrayBuffer.
   const owned = new Uint8Array(data.byteLength);
   owned.set(data);
-
   const stream = new Blob([owned.buffer])
     .stream()
     .pipeThrough(new DecompressionStream("deflate-raw"));
@@ -244,9 +245,6 @@ function parseCellValue(cellXml: string, attrs: Record<string, string>, sharedSt
   }
 
   if (!hasValue && inlineFormula === undefined) return null;
-  // Empty source cells are implicit in the RAW model. Keeping hundreds of
-  // thousands of styled empty cells would only increase clone/upload cost.
-  // Formula cells remain explicit even when their cached result is blank.
   if ((value === "" || value === null) && inlineFormula === undefined) return null;
 
   const cell: RawCell = { v: value };
@@ -260,7 +258,7 @@ function normalizedHeader(cell: RawCell | null): string {
   return String(cell.v).replace(/\s+/g, " ").trim().toUpperCase();
 }
 
-const criticalHeaders = {
+const criticalHeaders: Record<ParseKey, Record<string, string>> = {
   planning: {
     A: "PROGRAM",
     C: "EPICORPART",
@@ -276,20 +274,62 @@ const criticalHeaders = {
     R: "RECIPE#",
     AJ: "STATUS",
   },
-} as const;
+  routing: {
+    D: "PROGRAM",
+    E: "EPICORPART",
+    J: "JOBNUM",
+    AC: "NEXTOPERATION",
+    CI: "OP.1",
+    CW: "OPRSEQ.1",
+    IN: "OPRSEQ.36",
+  },
+};
 
 function rowCell(rows: RawRow[], rowNo: number, column: string): RawCell | null {
   return rows[rowNo - 1]?.cells[column] ?? null;
 }
 
+function configForKey(key: ParseKey) {
+  if (key === "routing") {
+    return {
+      name: ROUTING_SOURCE.displayName,
+      headerRows: ROUTING_SOURCE.headerRows,
+      baselineColumns: ROUTING_SOURCE.baselineColumns,
+    };
+  }
+  return SOURCE_SHEETS[key];
+}
+
+function validateRoutingOperationHeaders(columns: SourceColumn[]) {
+  const headerToColumns = new Map<string, string[]>();
+  for (const column of columns) {
+    const header = (column.headerRow1 ?? "").trim();
+    if (!header) continue;
+    const current = headerToColumns.get(header) ?? [];
+    current.push(column.excelColumn);
+    headerToColumns.set(header, current);
+  }
+
+  for (let slot = 1; slot <= ROUTING_SOURCE.operationSlots; slot++) {
+    for (const prefix of ["Op.", "OpC.", "OpenNonConfOp.", "OprSeq."]) {
+      const header = `${prefix}${slot}`;
+      const found = headerToColumns.get(header) ?? [];
+      if (found.length !== 1) {
+        throw new Error(`Routing source must contain exactly one "${header}" column; found ${found.length}.`);
+      }
+    }
+  }
+}
+
 function parseWorksheetXml(
   xml: string,
   sharedStrings: string[],
-  key: "planning" | "scheduling",
+  key: ParseKey,
   progressStart: number,
-  progressEnd: number
+  progressEnd: number,
+  actualSheetName?: string
 ): ParsedSheet {
-  const config = SOURCE_SHEETS[key];
+  const config = configForKey(key);
   const { totalRows, totalColumns } = parseDimension(xml);
 
   if (totalColumns < config.baselineColumns) {
@@ -330,7 +370,7 @@ function parseWorksheetXml(
       const percent = Math.round(progressStart + (approximateRow / totalRows) * (progressEnd - progressStart));
       if (percent > lastReported) {
         lastReported = percent;
-        postProgress({ stage: "PARSING", sheet: config.name, percent });
+        postProgress({ stage: "PARSING", sheet: actualSheetName ?? config.name, percent });
       }
     }
   }
@@ -338,7 +378,7 @@ function parseWorksheetXml(
   for (const [letter, expected] of Object.entries(criticalHeaders[key])) {
     const actual = normalizedHeader(rowCell(rows, config.headerRows, letter));
     if (actual !== expected) {
-      throw new Error(`${config.name}: expected ${letter}${config.headerRows} to be "${expected}", found "${actual || "<blank>"}".`);
+      throw new Error(`${actualSheetName ?? config.name}: expected ${letter}${config.headerRows} to be "${expected}", found "${actual || "<blank>"}".`);
     }
   }
 
@@ -358,8 +398,18 @@ function parseWorksheetXml(
     });
   }
 
-  postProgress({ stage: "PARSING", sheet: config.name, percent: progressEnd });
-  return { key, name: config.name, totalRows, totalColumns, headerRows: config.headerRows, columns, rows };
+  if (key === "routing") validateRoutingOperationHeaders(columns);
+
+  postProgress({ stage: "PARSING", sheet: actualSheetName ?? config.name, percent: progressEnd });
+  return {
+    key,
+    name: actualSheetName ?? config.name,
+    totalRows,
+    totalColumns,
+    headerRows: config.headerRows,
+    columns,
+    rows,
+  };
 }
 
 async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
@@ -369,57 +419,87 @@ async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
     .join("");
 }
 
+async function workbookParts(buffer: ArrayBuffer) {
+  const entries = readZipDirectory(buffer);
+  postProgress({ stage: "UNPACKING", percent: 12, detail: "Workbook metadata" });
+  const workbookXml = await readZipText(buffer, entries, "xl/workbook.xml");
+  const relsXml = await readZipText(buffer, entries, "xl/_rels/workbook.xml.rels");
+  const refs = parseWorkbookSheetRefs(workbookXml);
+  const relationships = parseWorkbookRelationships(relsXml);
+
+  const paths = new Map<string, string>();
+  for (const ref of refs) {
+    const path = relationships.get(ref.relId);
+    if (path) paths.set(ref.name, path);
+  }
+
+  postProgress({ stage: "UNPACKING", percent: 14, detail: "Shared strings" });
+  const sharedXml = entries.has("xl/sharedStrings.xml")
+    ? await readZipText(buffer, entries, "xl/sharedStrings.xml")
+    : "";
+  const sharedStrings = sharedXml ? parseSharedStrings(sharedXml) : [];
+  return { entries, refs, paths, sharedStrings };
+}
+
+async function parseStWorkbook(request: ParseRequest): Promise<DoneMessage> {
+  const { entries, paths, sharedStrings } = await workbookParts(request.buffer);
+  const planningPath = paths.get(SOURCE_SHEETS.planning.name);
+  const schedulingPath = paths.get(SOURCE_SHEETS.scheduling.name);
+  if (!planningPath) throw new Error(`Required worksheet not found: ${SOURCE_SHEETS.planning.name}`);
+  if (!schedulingPath) throw new Error(`Required worksheet not found: ${SOURCE_SHEETS.scheduling.name}`);
+
+  postProgress({ stage: "UNPACKING", percent: 17, sheet: SOURCE_SHEETS.planning.name });
+  const planningXml = await readZipText(request.buffer, entries, planningPath);
+  postProgress({ stage: "PARSING", percent: 20, sheet: SOURCE_SHEETS.planning.name });
+  const planning = parseWorksheetXml(planningXml, sharedStrings, "planning", 20, 76);
+
+  postProgress({ stage: "UNPACKING", percent: 78, sheet: SOURCE_SHEETS.scheduling.name });
+  const schedulingXml = await readZipText(request.buffer, entries, schedulingPath);
+  postProgress({ stage: "PARSING", percent: 80, sheet: SOURCE_SHEETS.scheduling.name });
+  const scheduling = parseWorksheetXml(schedulingXml, sharedStrings, "scheduling", 80, 96);
+
+  postProgress({ stage: "HASHING", percent: 98 });
+  const sha256 = await sha256Hex(request.buffer);
+  return {
+    type: "DONE",
+    mode: "ST",
+    sha256,
+    workbook: { filename: request.filename, sheets: [planning, scheduling] },
+  };
+}
+
+async function parseRoutingWorkbook(request: ParseRequest): Promise<DoneMessage> {
+  const { entries, refs, paths, sharedStrings } = await workbookParts(request.buffer);
+  if (!refs.length) throw new Error("The routing workbook has no worksheets.");
+
+  const preferred = refs.find((r) => r.name === "Sheet1") ?? refs[0];
+  const routePath = paths.get(preferred.name);
+  if (!routePath) throw new Error(`Unable to locate routing worksheet: ${preferred.name}`);
+
+  postProgress({ stage: "UNPACKING", percent: 18, sheet: preferred.name });
+  const routeXml = await readZipText(request.buffer, entries, routePath);
+  postProgress({ stage: "PARSING", percent: 22, sheet: preferred.name });
+  const routing = parseWorksheetXml(routeXml, sharedStrings, "routing", 22, 96, preferred.name);
+
+  postProgress({ stage: "HASHING", percent: 98 });
+  const sha256 = await sha256Hex(request.buffer);
+  return {
+    type: "DONE",
+    mode: "ROUTING",
+    sha256,
+    routingWorkbook: { filename: request.filename, sheet: routing },
+  };
+}
+
 self.onmessage = async (event: MessageEvent<ParseRequest>) => {
   const request = event.data;
   if (!request || request.type !== "PARSE") return;
 
   try {
     postProgress({ stage: "LOCATING", percent: 10 });
-    const entries = readZipDirectory(request.buffer);
-
-    postProgress({ stage: "UNPACKING", percent: 12, detail: "Workbook metadata" });
-    const workbookXml = await readZipText(request.buffer, entries, "xl/workbook.xml");
-    const relsXml = await readZipText(request.buffer, entries, "xl/_rels/workbook.xml.rels");
-    const refs = parseWorkbookSheetRefs(workbookXml);
-    const relationships = parseWorkbookRelationships(relsXml);
-
-    const paths = new Map<string, string>();
-    for (const ref of refs) {
-      const path = relationships.get(ref.relId);
-      if (path) paths.set(ref.name, path);
-    }
-
-    const planningPath = paths.get(SOURCE_SHEETS.planning.name);
-    const schedulingPath = paths.get(SOURCE_SHEETS.scheduling.name);
-    if (!planningPath) throw new Error(`Required worksheet not found: ${SOURCE_SHEETS.planning.name}`);
-    if (!schedulingPath) throw new Error(`Required worksheet not found: ${SOURCE_SHEETS.scheduling.name}`);
-
-    postProgress({ stage: "UNPACKING", percent: 14, detail: "Shared strings" });
-    const sharedXml = entries.has("xl/sharedStrings.xml")
-      ? await readZipText(request.buffer, entries, "xl/sharedStrings.xml")
-      : "";
-    const sharedStrings = sharedXml ? parseSharedStrings(sharedXml) : [];
-
-    postProgress({ stage: "UNPACKING", percent: 17, sheet: SOURCE_SHEETS.planning.name });
-    const planningXml = await readZipText(request.buffer, entries, planningPath);
-    postProgress({ stage: "PARSING", percent: 20, sheet: SOURCE_SHEETS.planning.name });
-    const planning = parseWorksheetXml(planningXml, sharedStrings, "planning", 20, 76);
-
-    postProgress({ stage: "UNPACKING", percent: 78, sheet: SOURCE_SHEETS.scheduling.name });
-    const schedulingXml = await readZipText(request.buffer, entries, schedulingPath);
-    postProgress({ stage: "PARSING", percent: 80, sheet: SOURCE_SHEETS.scheduling.name });
-    const scheduling = parseWorksheetXml(schedulingXml, sharedStrings, "scheduling", 80, 96);
-
-    // Release the large XML strings before hashing and transferring results.
-    postProgress({ stage: "HASHING", percent: 98 });
-    const sha256 = await sha256Hex(request.buffer);
-
-    const result: DoneMessage = {
-      type: "DONE",
-      sha256,
-      workbook: { filename: request.filename, sheets: [planning, scheduling] },
-    };
-
+    const result = request.mode === "ROUTING"
+      ? await parseRoutingWorkbook(request)
+      : await parseStWorkbook(request);
     postProgress({ stage: "COMPLETE", percent: 100 });
     self.postMessage(result);
   } catch (error) {

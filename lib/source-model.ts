@@ -13,6 +13,27 @@ export const SOURCE_SHEETS = {
 
 export type SourceSheetKey = keyof typeof SOURCE_SHEETS;
 
+
+export const ROUTING_SOURCE = {
+  displayName: "All Open Jobs Routing",
+  headerRows: 1,
+  baselineColumns: 248,
+  operationSlots: 36,
+} as const;
+
+export const ROUTING_CORE_COLUMNS = {
+  program: "D",
+  epicorPart: "E",
+  jobNum: "J",
+  prodQty: "L",
+  lastLaborOp: "M",
+  revisionNum: "X",
+  lastLaborOprSeq: "AB",
+  nextOperation: "AC",
+  jobComplete: "AD",
+  lastCompleteOprSeq: "AZ",
+} as const;
+
 export const PLANNING_OPERATION_RANGE = { start: 13, end: 48 } as const;
 
 export const SCHEDULING_RESOURCE_COLUMNS: Record<number, string> = {

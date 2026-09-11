@@ -1,70 +1,64 @@
-# ST Planning — Clean Rebuild v007 (Phase 2 + Phase 3)
+# ST Planning — Clean Rebuild v008
 
-A clean Next.js + Aiven PostgreSQL rebuild based only on two approved Excel source sheets.
+Clean Next.js + Aiven PostgreSQL rebuild with three controlled source datasets.
 
-## Scope implemented
+## Controlled sources
 
-- Aiven PostgreSQL clean schema
-- Full RAW import of both source sheets
-- Source structure/header preservation
-- Browser-side Excel parsing
-- Sequential chunk transfer for Vercel/Aiven safety
-- Import validation before snapshot activation
-- Planning normalization
-- Main Scheduling normalization
-- Resource-lane normalization
-- English ERP-style validation UI
-- Phase 2 optimized Planning operational view
-- Phase 3 Scheduling table + resource timeline
-- Server-side filters/sort, column chooser and browser-local Saved Views
+1. `SirusClean_Painting_MasterList` — ST Planning attributes
+2. `Main Planning` — Scheduling source
+3. All Open Jobs — authoritative full Job operation route
 
-No legacy ST Planning business logic is included.
+## Current application scope
 
-## 1. Create a fresh database
+- Complete RAW retention for the two ST workbook sheets
+- Independent RAW retention for All Open Jobs routing
+- Planning normalized operational view
+- Scheduling normalized operational view + resource timeline
+- Full Job routing normalization through 36 operation slots
+- Job Routing Explorer
+- English ERP UI
+- Sequential import designed for Aiven/Vercel connection limits
 
-Create a new Aiven PostgreSQL service/database, then run:
+No legacy Candidate/Batch/Recipe/Planning Chain/Auto Planning logic is included.
 
-```sql
--- db/schema.sql
+## Database setup
 
-### Aiven SQL execution order (max 8 statements per run)
-
-Run the database scripts **one file at a time** in this exact order:
+Aiven Query Editor is limited to a maximum of 8 SQL statements per run.
+Run one file at a time, in order:
 
 ```text
-db/01_core_raw.sql      # 7 statements
-db/02_planning.sql      # 8 statements
-db/03_scheduling.sql    # 7 statements
-db/04_views.sql         # 3 statements
-db/verify.sql           # 6 SELECT statements, optional after import
+db/01_core_raw.sql           # 7 statements
+db/02_planning.sql           # 8 statements
+db/03_scheduling.sql         # 7 statements
+db/04_views.sql              # 3 statements
+db/05_routing_core.sql       # 8 statements
+db/06_routing_operations.sql # 7 statements
 ```
 
-`db/schema.sql` is now only a pointer/instruction file and should not be executed as the full schema.
+If your v007 database already exists, run only:
 
+```text
+db/05_routing_core.sql
+db/06_routing_operations.sql
 ```
 
-You can use Aiven Query Editor, psql, DBeaver, pgAdmin, or another PostgreSQL client.
+Verification is also split to stay below the same limit:
 
-## 2. Configure environment variables
-
-Copy `.env.example` to `.env.local`:
-
-```bash
-cp .env.example .env.local
+```text
+db/verify_st.sql      # 6 statements
+db/verify_routing.sql # 5 statements
 ```
 
-Set:
+## Environment
+
+Copy `.env.example` to `.env.local` and configure:
 
 ```env
 DATABASE_URL=postgresql://avnadmin:PASSWORD@HOST:PORT/defaultdb
 AIVEN_CA_CERT=-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----
 ```
 
-`AIVEN_CA_CERT` is recommended. If it is omitted, the app still uses TLS but does not verify the certificate chain.
-
-Do not append conflicting Node/PostgreSQL SSL query parameters to `DATABASE_URL` when `AIVEN_CA_CERT` is used.
-
-## 3. Install and build
+## Local run
 
 ```bash
 npm install
@@ -72,59 +66,50 @@ npm run build
 npm run dev
 ```
 
-## 4. Import workbook
-
 Open:
 
 ```text
-/data import page: /import
+http://localhost:3000
 ```
 
-Select the workbook containing exactly these required sheet names:
+## Import order
+
+Open `/import`.
+
+The two import sections are independent:
+
+### ST Planning Workbook
+
+Required worksheets:
 
 - `SirusClean_Painting_MasterList`
 - `Main Planning`
 
-The browser reads the current used range. RAW data is sent sequentially in chunks capped by row count and approximate JSON size.
+### All Open Jobs Routing
 
-## 5. Validation/activation
+Select the All Open Jobs workbook containing:
 
-The import is activated only when these checks all pass:
+- JobNum
+- NextOperation
+- Op.1..Op.36
+- OpC.1..OpC.36
+- OpenNonConfOp.1..OpenNonConfOp.36
+- OprSeq.1..OprSeq.36
 
-- Planning RAW row count = source used-range row count
-- Scheduling RAW row count = source used-range row count
-- source column counts match the parsed workbook
-- normalized Planning rows = source rows minus 3 header rows
-- normalized Scheduling rows = source rows minus 2 header rows
+The current approved file has 6,499 Jobs and 248 source columns.
 
-The previous active snapshot is deactivated only after the new import passes validation.
+## Pages
 
-## 6. Pages
-
-- `/` Overview
-- `/import` Data Import
-- `/planning` Planning operational view
-- `/scheduling` Scheduling operational view
-
-## 7. Vercel
-
-Use normal Next.js detection:
-
-- Framework Preset: Next.js
-- Root Directory: repository root
-- Build Command: default (`npm run build`)
-- Output Directory: default / blank
-- Install Command: default
-
-Do not set Output Directory to `public` or `.next`.
-
-Add `DATABASE_URL` and `AIVEN_CA_CERT` in Vercel Environment Variables, then redeploy.
+```text
+/            Operations Overview
+/import      Data Import
+/routing     Full Job Routing
+/planning    Phase 2 Planning
+/scheduling  Phase 3 Scheduling
+```
 
 ## Design rule
 
-The RAW layer is immutable source evidence. Future application edits and business logic must be stored in operational/business tables, not written back over RAW imported rows.
+RAW source evidence is immutable. Future business rules are added only to operational/business layers after explicit approval.
 
-
-## Phase 2 + Phase 3
-
-See `docs/PHASE2_PHASE3.md` for the complete implemented scope. No additional SQL migration is required.
+See `README_v008.md` and `docs/ROUTING_SOURCE.md` for routing details.

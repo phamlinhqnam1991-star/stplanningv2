@@ -59,3 +59,22 @@ export function excelDurationToMinutes(value: unknown): number | null {
 export function isNonBlank(value: unknown): boolean {
   return value !== null && value !== undefined && String(value) !== "";
 }
+
+export function asBooleanFlag(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
+  if (typeof value !== "string") return null;
+  const text = value.trim().toLowerCase();
+  if (["1", "true", "yes", "y"].includes(text)) return true;
+  if (["0", "false", "no", "n"].includes(text)) return false;
+  return null;
+}
+
+export function operationCodeFromSource(value: unknown): string | null {
+  const text = asText(value)?.trim();
+  if (!text) return null;
+  const bracketed = /^\[([^\]]+)\]/.exec(text);
+  if (bracketed) return bracketed[1].trim() || null;
+  const beforeMarker = text.split("»", 1)[0]?.trim();
+  return beforeMarker || null;
+}

@@ -1,9 +1,13 @@
--- ST Planning Clean Rebuild v002
--- IMPORTANT: Aiven execution limit requested by user = maximum 8 SQL statements per run.
--- Do NOT execute this file as a schema batch.
--- Run these files ONE AT A TIME and IN ORDER:
---   01_core_raw.sql   : 7 statements
---   02_planning.sql   : 8 statements
---   03_scheduling.sql : 7 statements
---   04_views.sql      : 3 statements
--- Then optionally run verify.sql (6 SELECT statements).
+-- ST Planning Clean Rebuild v008
+-- Aiven Query Editor is limited to 8 statements per execution.
+-- Run these files IN ORDER. Do not run this instruction file as schema SQL.
+--
+-- 01_core_raw.sql          : 7 statements
+-- 02_planning.sql          : 8 statements
+-- 03_scheduling.sql        : 7 statements
+-- 04_views.sql             : 3 statements
+-- 05_routing_core.sql      : 8 statements
+-- 06_routing_operations.sql: 7 statements
+--
+-- Existing v007 database:
+-- only run 05_routing_core.sql then 06_routing_operations.sql.

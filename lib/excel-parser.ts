@@ -1,6 +1,6 @@
 "use client";
 
-import type { ParsedWorkbook } from "@/lib/types";
+import type { ParsedRoutingWorkbook, ParsedWorkbook } from "@/lib/types";
 
 export type ParseProgress = {
   stage: "READING" | "LOCATING" | "UNPACKING" | "PARSING" | "HASHING" | "COMPLETE";
@@ -16,7 +16,9 @@ type WorkerProgressMessage = {
 
 type WorkerDoneMessage = {
   type: "DONE";
-  workbook: ParsedWorkbook;
+  mode: "ST" | "ROUTING";
+  workbook?: ParsedWorkbook;
+  routingWorkbook?: ParsedRoutingWorkbook;
   sha256: string;
 };
 
@@ -31,10 +33,11 @@ function yieldToBrowser(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-export async function parseWorkbook(
+async function runParserWorker(
   file: File,
+  mode: "ST" | "ROUTING",
   onProgress?: (progress: ParseProgress) => void
-): Promise<{ workbook: ParsedWorkbook; sha256: string }> {
+): Promise<WorkerDoneMessage> {
   onProgress?.({ stage: "READING", percent: 2 });
   await yieldToBrowser();
 
@@ -45,13 +48,14 @@ export async function parseWorkbook(
   return await new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./excel-parser.worker.ts", import.meta.url), {
       type: "module",
-      name: "st-planning-excel-parser",
+      name: mode === "ROUTING" ? "st-routing-excel-parser" : "st-planning-excel-parser",
     });
 
     let settled = false;
+    const timeoutMs = mode === "ROUTING" ? 180_000 : 120_000;
     const watchdog = window.setTimeout(() => {
-      fail("Excel parsing timed out after 120 seconds. The workbook may be damaged or unusually large.");
-    }, 120_000);
+      fail(`Excel parsing timed out after ${Math.round(timeoutMs / 1000)} seconds. The workbook may be damaged or unusually large.`);
+    }, timeoutMs);
 
     const cleanup = () => {
       window.clearTimeout(watchdog);
@@ -84,13 +88,31 @@ export async function parseWorkbook(
         if (settled) return;
         settled = true;
         cleanup();
-        resolve({ workbook: message.workbook, sha256: message.sha256 });
+        resolve(message);
       }
     };
 
     worker.onerror = (event) => fail(event.message || "Excel parser worker crashed.");
     worker.onmessageerror = () => fail("The browser could not transfer parsed Excel data from the worker.");
 
-    worker.postMessage({ type: "PARSE", filename: file.name, buffer }, [buffer]);
+    worker.postMessage({ type: "PARSE", mode, filename: file.name, buffer }, [buffer]);
   });
+}
+
+export async function parseWorkbook(
+  file: File,
+  onProgress?: (progress: ParseProgress) => void
+): Promise<{ workbook: ParsedWorkbook; sha256: string }> {
+  const result = await runParserWorker(file, "ST", onProgress);
+  if (!result.workbook) throw new Error("The ST workbook parser returned no workbook data.");
+  return { workbook: result.workbook, sha256: result.sha256 };
+}
+
+export async function parseRoutingWorkbook(
+  file: File,
+  onProgress?: (progress: ParseProgress) => void
+): Promise<{ workbook: ParsedRoutingWorkbook; sha256: string }> {
+  const result = await runParserWorker(file, "ROUTING", onProgress);
+  if (!result.routingWorkbook) throw new Error("The routing workbook parser returned no route data.");
+  return { workbook: result.routingWorkbook, sha256: result.sha256 };
 }

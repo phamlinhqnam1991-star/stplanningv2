@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 const nav = [
   { href: "/", code: "SYS-00", label: "Overview" },
   { href: "/import", code: "DATA-01", label: "Data Import" },
+  { href: "/routing", code: "ROUTE-05", label: "Job Routing" },
   { href: "/planning", code: "PLAN-10", label: "Planning" },
   { href: "/scheduling", code: "SCH-20", label: "Scheduling" },
 ];
@@ -37,8 +38,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v007</strong>
-            <small>Phase 2 Planning + Phase 3 Scheduling</small>
+            <strong>Clean Rebuild v008</strong>
+            <small>Full Job Routing + Phase 2/3</small>
           </div>
         </div>
       </aside>

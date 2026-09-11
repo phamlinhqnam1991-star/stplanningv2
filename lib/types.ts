@@ -18,7 +18,7 @@ export type SourceColumn = {
 };
 
 export type ParsedSheet = {
-  key: "planning" | "scheduling";
+  key: "planning" | "scheduling" | "routing";
   name: string;
   totalRows: number;
   totalColumns: number;
@@ -30,4 +30,10 @@ export type ParsedSheet = {
 export type ParsedWorkbook = {
   filename: string;
   sheets: ParsedSheet[];
+};
+
+
+export type ParsedRoutingWorkbook = {
+  filename: string;
+  sheet: ParsedSheet;
 };
