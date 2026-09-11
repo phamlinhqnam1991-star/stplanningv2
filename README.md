@@ -1,4 +1,4 @@
-# ST Planning — Clean Rebuild v001
+# ST Planning — Clean Rebuild v007 (Phase 2 + Phase 3)
 
 A clean Next.js + Aiven PostgreSQL rebuild based only on two approved Excel source sheets.
 
@@ -14,7 +14,9 @@ A clean Next.js + Aiven PostgreSQL rebuild based only on two approved Excel sour
 - Main Scheduling normalization
 - Resource-lane normalization
 - English ERP-style validation UI
-- Planning and Scheduling read-only views
+- Phase 2 optimized Planning operational view
+- Phase 3 Scheduling table + resource timeline
+- Server-side filters/sort, column chooser and browser-local Saved Views
 
 No legacy ST Planning business logic is included.
 
@@ -121,3 +123,8 @@ Add `DATABASE_URL` and `AIVEN_CA_CERT` in Vercel Environment Variables, then red
 ## Design rule
 
 The RAW layer is immutable source evidence. Future application edits and business logic must be stored in operational/business tables, not written back over RAW imported rows.
+
+
+## Phase 2 + Phase 3
+
+See `docs/PHASE2_PHASE3.md` for the complete implemented scope. No additional SQL migration is required.

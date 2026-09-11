@@ -37,8 +37,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v001</strong>
-            <small>RAW + Operational baseline</small>
+            <strong>Clean Rebuild v007</strong>
+            <small>Phase 2 Planning + Phase 3 Scheduling</small>
           </div>
         </div>
       </aside>
