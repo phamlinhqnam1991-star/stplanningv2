@@ -4,6 +4,18 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiJson } from "@/lib/api-client";
 
 type Operation = { code: string; value: string; order: number; sourceColumn: string };
+type RouteAnalysis = {
+  currentPosition: number | null;
+  currentSequence: number | null;
+  currentOperation: string | null;
+  positionSource: "NEXT_OPERATION" | "FIRST_INCOMPLETE" | "COMPLETE" | "NO_ROUTE";
+  remainingCount: number;
+  stScopeAvailable: boolean;
+  remainingStCount: number;
+  remainingStRoute: { position: number; code: string; sequence: number | null }[];
+  nextStOperation: string | null;
+  nextStSequence: number | null;
+};
 type PlanningRow = {
   id: string;
   source_row_no: number;
@@ -30,13 +42,16 @@ type PlanningRow = {
   impact_sale_value: string | null;
   operation_count: number;
   operations: Operation[];
+  route_id: string | null;
+  route_operation_count: number | null;
+  routeAnalysis: RouteAnalysis | null;
 };
 
 type PlanningSummary = { total: number; totalQty: number; totalSurface: number; programs: number; priorityRows: number };
 type Meta = { programs: string[]; nextOperations: string[]; operations: string[]; priorities: string[] };
 type SortKey = "row" | "program" | "part" | "revision" | "job" | "nextOperation" | "prodQty" | "goodWip" | "surface" | "priority";
 type Direction = "asc" | "desc";
-type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
+type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "routePos" | "nextSt" | "remainingSt" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
 
 type ViewState = {
   search: string;
@@ -62,6 +77,9 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "job", label: "Job", sort: "job" },
   { key: "nextOp", label: "Next Operation", sort: "nextOperation" },
   { key: "lastOp", label: "Last Operation" },
+  { key: "routePos", label: "Route Position" },
+  { key: "nextSt", label: "Next ST Operation" },
+  { key: "remainingSt", label: "Remaining ST Route" },
   { key: "prodQty", label: "Prod Qty", sort: "prodQty", align: "num" },
   { key: "goodWip", label: "Good WIP", sort: "goodWip", align: "num" },
   { key: "surface", label: "Surface dm²", sort: "surface", align: "num" },
@@ -73,9 +91,9 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "operations", label: "ST Operations" },
 ];
 
-const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale", "operations"];
-const STORAGE_KEY = "st-planning.phase2.saved-views.v1";
-const CURRENT_KEY = "st-planning.phase2.current-view.v1";
+const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "routePos", "nextSt", "remainingSt", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale"];
+const STORAGE_KEY = "st-planning.phase2.saved-views.v2";
+const CURRENT_KEY = "st-planning.phase2.current-view.v2";
 
 function fmt(value: unknown, digits = 0) {
   const n = Number(value);
@@ -215,6 +233,9 @@ export function PlanningTable() {
       case "job": return row.job_num ? <a className="mono route-link" href={`/routing?search=${encodeURIComponent(row.job_num)}`}>{row.job_num}</a> : <span className="mono">—</span>;
       case "nextOp": return <span className="op-chip">{row.next_operation || "—"}</span>;
       case "lastOp": return row.last_labor_op || "—";
+      case "routePos": return row.routeAnalysis ? <span className="route-position-badge" title={row.routeAnalysis.positionSource.replaceAll("_", " ")}>{row.routeAnalysis.currentPosition ? `${row.routeAnalysis.currentPosition}/${row.route_operation_count || "?"}` : "COMPLETE"}</span> : <span className="muted">No route</span>;
+      case "nextSt": return row.routeAnalysis?.nextStOperation ? <span className="next-st-badge" title={row.routeAnalysis.nextStSequence != null ? `OprSeq ${row.routeAnalysis.nextStSequence}` : undefined}>{row.routeAnalysis.nextStOperation}</span> : <span className="muted">—</span>;
+      case "remainingSt": return row.routeAnalysis?.remainingStRoute?.length ? <div className="planning-st-route" title={`${row.routeAnalysis.remainingStCount} remaining ST operations`}>{row.routeAnalysis.remainingStRoute.slice(0, 5).map((op) => <span key={`${op.position}-${op.code}`}>{op.code}</span>)}{row.routeAnalysis.remainingStRoute.length > 5 ? <b>+{row.routeAnalysis.remainingStRoute.length - 5}</b> : null}</div> : <span className="muted">{row.routeAnalysis?.stScopeAvailable ? "Complete" : "No ST scope"}</span>;
       case "prodQty": return fmt(row.prod_qty);
       case "goodWip": return fmt(row.current_good_wip_qty);
       case "surface": return fmt(row.surface_dm2, 2);

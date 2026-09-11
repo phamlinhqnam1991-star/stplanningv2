@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
+import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +13,24 @@ const sortMap: Record<string, string> = {
   revision: "j.revision_num",
   next: "j.next_operation",
   count: "j.operation_count",
+};
+
+type RoutingDbRow = {
+  id: string;
+  source_row_no: number;
+  program: string | null;
+  epicor_part: string | null;
+  revision_num: string | null;
+  job_num: string | null;
+  prod_qty: number | string | null;
+  last_labor_op: string | null;
+  last_labor_opr_seq: number | null;
+  next_operation: string | null;
+  last_complete_opr_seq: number | null;
+  job_complete: boolean | null;
+  operation_count: number;
+  st_all_operation: string | null;
+  operations: RouteOperationForAnalysis[];
 };
 
 export async function GET(request: Request) {
@@ -62,10 +81,11 @@ export async function GET(request: Request) {
     const rowParams = [...params, limit, offset];
     const limitParam = `$${rowParams.length - 1}`;
     const offsetParam = `$${rowParams.length}`;
-    const rows = await query(
+    const rows = await query<RoutingDbRow>(
       `SELECT j.id, j.source_row_no, j.program, j.epicor_part, j.revision_num, j.job_num,
               j.prod_qty, j.last_labor_op, j.last_labor_opr_seq, j.next_operation,
               j.last_complete_opr_seq, j.job_complete, j.operation_count,
+              planning.all_operation AS st_all_operation,
               COALESCE(
                 jsonb_agg(
                   jsonb_build_object(
@@ -80,19 +100,35 @@ export async function GET(request: Request) {
               ) AS operations
        FROM v_active_job_routes j
        LEFT JOIN v_active_job_operation_sequence o ON o.job_route_id=j.id
+       LEFT JOIN LATERAL (
+         SELECT p.all_operation
+         FROM v_active_planning_jobs p
+         WHERE p.job_num=j.job_num
+         ORDER BY p.source_row_no
+         LIMIT 1
+       ) planning ON true
        ${whereSql}
        GROUP BY j.id, j.source_row_no, j.program, j.epicor_part, j.revision_num, j.job_num,
                 j.prod_qty, j.last_labor_op, j.last_labor_opr_seq, j.next_operation,
-                j.last_complete_opr_seq, j.job_complete, j.operation_count
+                j.last_complete_opr_seq, j.job_complete, j.operation_count, planning.all_operation
        ORDER BY ${sortSql} ${direction} NULLS LAST, j.source_row_no ASC
        LIMIT ${limitParam} OFFSET ${offsetParam}`,
       rowParams
     );
 
+    const analyzedRows = rows.rows.map((row: RoutingDbRow) => ({
+      ...row,
+      routeAnalysis: analyzeRoute(row.operations, row.next_operation, row.st_all_operation),
+    }));
+
     const s = summary.rows[0] || { total: 0, programs: 0, operations: 0, with_next: 0 };
+    const pageWithStScope = analyzedRows.filter((row: RoutingDbRow & { routeAnalysis: ReturnType<typeof analyzeRoute> }) => row.routeAnalysis.stScopeAvailable).length;
+    const pageWithNextSt = analyzedRows.filter((row: RoutingDbRow & { routeAnalysis: ReturnType<typeof analyzeRoute> }) => Boolean(row.routeAnalysis.nextStOperation)).length;
+    const pageNextMatched = analyzedRows.filter((row: RoutingDbRow & { routeAnalysis: ReturnType<typeof analyzeRoute> }) => row.routeAnalysis.routeMatched).length;
+
     return NextResponse.json({
       total: s.total,
-      rows: rows.rows,
+      rows: analyzedRows,
       limit,
       offset,
       summary: {
@@ -100,6 +136,9 @@ export async function GET(request: Request) {
         programs: s.programs,
         operations: s.operations,
         withNext: s.with_next,
+        pageWithStScope,
+        pageWithNextSt,
+        pageNextMatched,
       },
     });
   } catch (error) {

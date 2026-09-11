@@ -1,3 +1,7 @@
+# v009 Route Analysis
+
+See `README_v009.md` and `docs/ROUTING_ANALYSIS.md`. No SQL migration is required from v008.
+
 # ST Planning — Clean Rebuild v008
 
 Clean Next.js + Aiven PostgreSQL rebuild with three controlled source datasets.

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
 import { SOURCE_SHEETS } from "@/lib/source-model";
+import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -118,7 +119,9 @@ export async function GET(request: Request) {
               rr.row_data->'CN'->>'v' AS cat_transit,
               rr.row_data->'CO'->>'v' AS impact_sale_value,
               COALESCE(op.operation_count,0)::int AS operation_count,
-              COALESCE(op.operations,'[]'::jsonb) AS operations
+              COALESCE(op.operations,'[]'::jsonb) AS operations,
+              route.route_id, route.route_next_operation, route.route_operation_count,
+              COALESCE(route.route_operations,'[]'::jsonb) AS route_operations
        ${fromSql}
        LEFT JOIN LATERAL (
          SELECT count(*)::int AS operation_count,
@@ -133,16 +136,49 @@ export async function GET(request: Request) {
          FROM planning_job_operations o
          WHERE o.planning_job_id = p.id
        ) op ON true
+       LEFT JOIN LATERAL (
+         SELECT jr.id AS route_id,
+                jr.next_operation AS route_next_operation,
+                jr.operation_count AS route_operation_count,
+                COALESCE((
+                  SELECT jsonb_agg(
+                    jsonb_build_object(
+                      'position', ro.operation_position,
+                      'code', ro.operation_code,
+                      'sequence', ro.operation_seq,
+                      'complete', ro.is_complete,
+                      'openNonconformance', ro.open_nonconformance,
+                      'sourceText', ro.source_operation_text
+                    ) ORDER BY ro.operation_position
+                  )
+                  FROM v_active_job_operation_sequence ro
+                  WHERE ro.job_route_id=jr.id
+                ), '[]'::jsonb) AS route_operations
+         FROM v_active_job_routes jr
+         WHERE jr.job_num=p.job_num
+         ORDER BY jr.source_row_no
+         LIMIT 1
+       ) route ON true
        ${whereSql}
        ORDER BY ${sortSql} ${direction} NULLS LAST, p.source_row_no ASC
        LIMIT ${limitParam} OFFSET ${offsetParam}`,
       rowParams
     );
 
+    const analyzedRows = rows.rows.map((row: Record<string, unknown>) => {
+      const routeOperations = (row.route_operations || []) as RouteOperationForAnalysis[];
+      return {
+        ...row,
+        routeAnalysis: row.route_id
+          ? analyzeRoute(routeOperations, (row.route_next_operation as string | null) || (row.next_operation as string | null), row.all_operation as string | null)
+          : null,
+      };
+    });
+
     const s = summary.rows[0] || { total: 0, total_qty: "0", total_surface: "0", programs: 0, priority_rows: 0 };
     return NextResponse.json({
       total: s.total,
-      rows: rows.rows,
+      rows: analyzedRows,
       limit,
       offset,
       summary: {
