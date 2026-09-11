@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
 import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
-import { applyMainOperationMapping, getConfigBootstrap, getOperationMainMap, numberSetting, routeConfigOptionsFromSettings, sourceDisplayColumns } from "@/lib/config";
+import { getConfigBootstrap, numberSetting, routeConfigOptionsFromSettings, sourceDisplayColumns } from "@/lib/config";
+import { classifyOperationRoute, getPlanningModel } from "@/lib/planning-model";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,7 +28,7 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const bootstrap = await getConfigBootstrap();
     const routeOptions = routeConfigOptionsFromSettings(bootstrap.settings);
-    const mainOperationMap = await getOperationMainMap();
+    const planningModel = await getPlanningModel();
     const planningProfile = bootstrap.sources.PLANNING;
     const planningSheetName = planningProfile.sheetName || planningProfile.displayName;
     const display = sourceDisplayColumns(planningProfile);
@@ -182,14 +183,24 @@ export async function GET(request: Request) {
       const routeAnalysis = row.route_id
         ? analyzeRoute(routeOperations, (row.route_next_operation as string | null) || (row.next_operation as string | null), row.all_operation as string | null, routeOptions)
         : null;
-      const remainingMainOperations = routeAnalysis
-        ? applyMainOperationMapping(routeAnalysis.remainingStRoute.map((op) => op.code), mainOperationMap)
-        : [];
+      const planningClassification = routeAnalysis
+        ? classifyOperationRoute(routeAnalysis.remainingStRoute.map((op) => op.code), planningModel)
+        : null;
+      const remainingMainOperations = planningClassification?.remainingMainOperations.map((main) => ({
+        code: main.code,
+        label: main.label,
+        sourceOperation: planningClassification.steps.find((step) => step.mainOperationCode === main.code)?.sourceOperation || "",
+      })) || [];
+      const nextMain = planningClassification?.nextMainOperation || null;
       return {
         ...row,
         routeAnalysis,
-        nextMainOperation: routeAnalysis?.nextStOperation ? mainOperationMap[routeAnalysis.nextStOperation.toUpperCase()] ?? null : null,
+        planningClassification,
+        nextMainOperation: nextMain ? { code: nextMain.code, label: nextMain.label } : null,
+        nextPlanningOperation: planningClassification?.nextPlanningOperation || null,
         remainingMainOperations,
+        remainingPlanningOperations: planningClassification?.remainingPlanningOperations || [],
+        unmappedStOperations: planningClassification?.unmappedOperations || [],
       };
     });
 

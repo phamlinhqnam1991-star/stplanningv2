@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
 import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
-import { applyMainOperationMapping, getConfigBootstrap, getOperationMainMap, numberSetting, routeConfigOptionsFromSettings } from "@/lib/config";
+import { getConfigBootstrap, numberSetting, routeConfigOptionsFromSettings } from "@/lib/config";
+import { classifyOperationRoute, getPlanningModel } from "@/lib/planning-model";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,7 +40,7 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const bootstrap = await getConfigBootstrap();
     const routeOptions = routeConfigOptionsFromSettings(bootstrap.settings);
-    const mainOperationMap = await getOperationMainMap();
+    const planningModel = await getPlanningModel();
     const defaultView = bootstrap.views.find((v) => v.viewKey === "ROUTING" && v.isDefault)?.config || {};
     const defaultPageSize = numberSetting({ ...bootstrap.settings, "routing.defaultPageSize": defaultView.pageSize }, "routing.defaultPageSize", 25, 10, 500);
     const maxPageSize = numberSetting(bootstrap.settings, "ui.maxPageSize", 500, 10, 1000);
@@ -125,11 +126,21 @@ export async function GET(request: Request) {
 
     const analyzedRows = rows.rows.map((row: RoutingDbRow) => {
       const routeAnalysis = analyzeRoute(row.operations, row.next_operation, row.st_all_operation, routeOptions);
+      const planningClassification = classifyOperationRoute(routeAnalysis.remainingStRoute.map((op) => op.code), planningModel);
+      const nextMain = planningClassification.nextMainOperation;
       return {
         ...row,
         routeAnalysis,
-        nextMainOperation: routeAnalysis.nextStOperation ? mainOperationMap[routeAnalysis.nextStOperation.toUpperCase()] ?? null : null,
-        remainingMainOperations: applyMainOperationMapping(routeAnalysis.remainingStRoute.map((op) => op.code), mainOperationMap),
+        planningClassification,
+        nextMainOperation: nextMain ? { code: nextMain.code, label: nextMain.label } : null,
+        nextPlanningOperation: planningClassification.nextPlanningOperation,
+        remainingMainOperations: planningClassification.remainingMainOperations.map((main) => ({
+          code: main.code,
+          label: main.label,
+          sourceOperation: planningClassification.steps.find((step) => step.mainOperationCode === main.code)?.sourceOperation || "",
+        })),
+        remainingPlanningOperations: planningClassification.remainingPlanningOperations,
+        unmappedStOperations: planningClassification.unmappedOperations,
       };
     });
 

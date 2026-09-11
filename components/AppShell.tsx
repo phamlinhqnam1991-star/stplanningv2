@@ -10,6 +10,7 @@ const nav = [
   { href: "/planning", code: "PLAN-10", label: "Planning" },
   { href: "/scheduling", code: "SCH-20", label: "Scheduling" },
   { href: "/configuration", code: "CFG-90", label: "Configuration" },
+  { href: "/configuration/planning-model", code: "CFG-91", label: "Planning Model" },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -27,7 +28,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="nav-caption">OPERATIONS</div>
         <nav className="nav-list">
           {nav.map((item) => {
-            const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
+            const active = item.href === "/" ? pathname === "/" : item.href === "/configuration" ? pathname === "/configuration" : pathname.startsWith(item.href);
             return (
               <Link className={`nav-item ${active ? "active" : ""}`} href={item.href} key={item.href}>
                 <span className="nav-code">{item.code}</span>
@@ -39,8 +40,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v010</strong>
-            <small>Configuration-First Architecture</small>
+            <strong>Clean Rebuild v011</strong>
+            <small>Config-Driven Planning Model</small>
           </div>
         </div>
       </aside>

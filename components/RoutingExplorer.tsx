@@ -3,6 +3,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { apiJson } from "@/lib/api-client";
 
+type MainPlanningDefinition = {
+  code: string; label: string; planningOrder: number; planningEnabled: boolean; color: string | null;
+  stGroup: { code: string; label: string } | null; physicalArea: { code: string; label: string } | null;
+  scheduleArea: { code: string; label: string } | null; planner: { code: string; label: string } | null;
+};
+
 type RouteOperation = {
   position: number;
   code: string;
@@ -48,6 +54,9 @@ type RouteRow = {
   routeAnalysis: RouteAnalysis;
   nextMainOperation: { code: string; label: string } | null;
   remainingMainOperations: Array<{ code: string; label: string; sourceOperation: string }>;
+  nextPlanningOperation: MainPlanningDefinition | null;
+  remainingPlanningOperations: MainPlanningDefinition[];
+  unmappedStOperations: string[];
 };
 
 type BootstrapConfig = {
@@ -160,8 +169,8 @@ export function RoutingExplorer() {
                         <div className="route-analysis-line"><span>POSITION</span><strong>{a.currentPosition ? `${a.currentPosition}/${row.operation_count}` : "COMPLETE"}</strong><small>{a.positionSource.replaceAll("_", " ")}</small></div>
                         <div className="route-analysis-line"><span>REMAINING</span><strong>{a.remainingCount}</strong><small>operations</small></div>
                         <div className="route-analysis-line st"><span>REMAINING ST</span><strong>{a.stScopeAvailable ? a.remainingStCount : "—"}</strong><small>{a.stScopeAvailable ? "Planning scope" : "No Planning match"}</small></div>
-                        <div className="next-st-box"><span>NEXT ST</span><strong>{a.nextStOperation || "—"}</strong>{a.nextStSequence != null ? <small>Seq {a.nextStSequence}</small> : null}</div><div className="next-main-box"><span>NEXT MAIN</span><strong>{row.nextMainOperation?.label || "UNMAPPED"}</strong>{row.nextMainOperation ? <small>{row.nextMainOperation.code}</small> : null}</div>
-                        {a.remainingStRoute.length ? <div className="remaining-st-strip">{a.remainingStRoute.map((op) => <span key={`st-${row.id}-${op.position}`} title={`Position ${op.position} · Seq ${op.sequence ?? "—"}`}>{op.code}</span>)}</div> : null}{row.remainingMainOperations?.length ? <div className="remaining-main-strip">{row.remainingMainOperations.map((op) => <span key={`main-${row.id}-${op.code}`}>{op.label}</span>)}</div> : null}
+                        <div className="next-st-box"><span>NEXT ST</span><strong>{a.nextStOperation || "—"}</strong>{a.nextStSequence != null ? <small>Seq {a.nextStSequence}</small> : null}</div><div className="next-main-box"><span>NEXT MAIN</span><strong>{row.nextMainOperation?.label || "UNMAPPED"}</strong>{row.nextMainOperation ? <small>{row.nextMainOperation.code}</small> : null}</div><div className="next-planning-box"><span>NEXT PLANNING</span><strong>{row.nextPlanningOperation?.label || "—"}</strong>{row.nextPlanningOperation ? <small>Order {row.nextPlanningOperation.planningOrder} · {row.nextPlanningOperation.scheduleArea?.label || row.nextPlanningOperation.physicalArea?.label || "No area"}</small> : null}</div>
+                        {row.unmappedStOperations?.length ? <div className="route-unmapped-strip"><b>UNMAPPED</b>{row.unmappedStOperations.map((op) => <span key={`unmapped-${row.id}-${op}`}>{op}</span>)}</div> : null}{a.remainingStRoute.length ? <div className="remaining-st-strip">{a.remainingStRoute.map((op) => <span key={`st-${row.id}-${op.position}`} title={`Position ${op.position} · Seq ${op.sequence ?? "—"}`}>{op.code}</span>)}</div> : null}{row.remainingMainOperations?.length ? <div className="remaining-main-strip">{row.remainingMainOperations.map((op) => <span key={`main-${row.id}-${op.code}`}>{op.label}</span>)}</div> : null}
                       </div>
                     </td>
                     <td>

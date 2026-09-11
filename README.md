@@ -126,3 +126,7 @@ See `README_v010.md`, `docs/CONFIGURATION_ARCHITECTURE.md`, and `docs/ROUTING_SO
 ## v010 Configuration-First Extension
 
 Configuration is now the extension layer for source mappings, Main Operations, operation mappings, resources, statuses, areas, planners, recipe groups, runtime settings, shared views and future rule definitions. Existing v009 databases only need SQL 07 → 08 → 09. See `README_v010.md` and `docs/CONFIGURATION_ARCHITECTURE.md`.
+
+## v011 — Planning Model
+
+After v010, run `db/10_planning_model_config.sql`, then open `/configuration/planning-model` to create Main Operations and map imported operations. See `README_v011.md` and `docs/PLANNING_MODEL_CONFIG.md`.

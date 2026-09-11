@@ -1,20 +1,24 @@
--- ST Planning Clean Rebuild v010 — Configuration-First Architecture
+-- ST Planning Clean Rebuild v011 — Config-Driven Planning Model
 -- Aiven Query Editor: maximum 8 statements per execution.
 -- This file is an instruction index only. Run each numbered SQL file separately.
 --
 -- Fresh database — run in order:
--- 01_core_raw.sql           : 7 statements
--- 02_planning.sql           : 8 statements
--- 03_scheduling.sql         : 7 statements
--- 04_views.sql              : 3 statements
--- 05_routing_core.sql       : 8 statements
--- 06_routing_operations.sql : 7 statements
--- 07_config_core.sql         : 8 statements
--- 08_config_defaults.sql     : 7 statements
--- 09_config_links_seed.sql   : 4 statements
+-- 01_core_raw.sql             : 7 statements
+-- 02_planning.sql             : 8 statements
+-- 03_scheduling.sql           : 7 statements
+-- 04_views.sql                : 3 statements
+-- 05_routing_core.sql         : 8 statements
+-- 06_routing_operations.sql   : 7 statements
+-- 07_config_core.sql          : 8 statements
+-- 08_config_defaults.sql      : 7 statements
+-- 09_config_links_seed.sql    : 4 statements
+-- 10_planning_model_config.sql: 7 statements
+--
+-- Upgrade from v010:
+-- run only 10_planning_model_config.sql
 --
 -- Upgrade from v009:
--- run 07_config_core.sql -> 08_config_defaults.sql -> 09_config_links_seed.sql
+-- run 07 -> 08 -> 09 -> 10
 --
 -- Upgrade from v007 (before routing):
--- run 05 -> 06 -> 07 -> 08 -> 09
+-- run 05 -> 06 -> 07 -> 08 -> 09 -> 10

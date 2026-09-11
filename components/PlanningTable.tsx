@@ -4,6 +4,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiJson } from "@/lib/api-client";
 
 type Operation = { code: string; value: string; order: number; sourceColumn: string };
+type MainPlanningDefinition = {
+  code: string; label: string; planningOrder: number; planningEnabled: boolean; scheduleEnabled: boolean; batchEnabled: boolean;
+  color: string | null; shortCode: string | null;
+  stGroup: { code: string; label: string } | null;
+  physicalArea: { code: string; label: string } | null;
+  scheduleArea: { code: string; label: string } | null;
+  planner: { code: string; label: string } | null;
+};
 type RouteAnalysis = {
   currentPosition: number | null;
   currentSequence: number | null;
@@ -47,13 +55,16 @@ type PlanningRow = {
   routeAnalysis: RouteAnalysis | null;
   nextMainOperation: { code: string; label: string } | null;
   remainingMainOperations: Array<{ code: string; label: string; sourceOperation: string }>;
+  nextPlanningOperation: MainPlanningDefinition | null;
+  remainingPlanningOperations: MainPlanningDefinition[];
+  unmappedStOperations: string[];
 };
 
 type PlanningSummary = { total: number; totalQty: number; totalSurface: number; programs: number; priorityRows: number };
 type Meta = { programs: string[]; nextOperations: string[]; operations: string[]; priorities: string[] };
 type SortKey = "row" | "program" | "part" | "revision" | "job" | "nextOperation" | "prodQty" | "goodWip" | "surface" | "priority";
 type Direction = "asc" | "desc";
-type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "routePos" | "nextSt" | "nextMain" | "remainingSt" | "remainingMain" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
+type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "routePos" | "nextSt" | "nextMain" | "nextPlan" | "planningArea" | "planner" | "unmapped" | "remainingSt" | "remainingMain" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
 
 type ViewState = {
   search: string;
@@ -86,6 +97,10 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "routePos", label: "Route Position" },
   { key: "nextSt", label: "Next ST Operation" },
   { key: "nextMain", label: "Next Main Operation" },
+  { key: "nextPlan", label: "Next Planning Operation" },
+  { key: "planningArea", label: "Planning Area" },
+  { key: "planner", label: "Planner" },
+  { key: "unmapped", label: "Unmapped ST" },
   { key: "remainingSt", label: "Remaining ST Route" },
   { key: "remainingMain", label: "Remaining Main Route" },
   { key: "prodQty", label: "Prod Qty", sort: "prodQty", align: "num" },
@@ -99,7 +114,7 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "operations", label: "ST Operations" },
 ];
 
-const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "routePos", "nextSt", "nextMain", "remainingSt", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale"];
+const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "routePos", "nextSt", "nextPlan", "planningArea", "planner", "remainingSt", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale"];
 const STORAGE_KEY = "st-planning.phase2.saved-views.v2";
 const CURRENT_KEY = "st-planning.phase2.current-view.v2";
 
@@ -273,6 +288,10 @@ export function PlanningTable() {
       case "routePos": return row.routeAnalysis ? <span className="route-position-badge" title={row.routeAnalysis.positionSource.replaceAll("_", " ")}>{row.routeAnalysis.currentPosition ? `${row.routeAnalysis.currentPosition}/${row.route_operation_count || "?"}` : "COMPLETE"}</span> : <span className="muted">No route</span>;
       case "nextSt": return row.routeAnalysis?.nextStOperation ? <span className="next-st-badge" title={row.routeAnalysis.nextStSequence != null ? `OprSeq ${row.routeAnalysis.nextStSequence}` : undefined}>{row.routeAnalysis.nextStOperation}</span> : <span className="muted">—</span>;
       case "nextMain": return row.nextMainOperation ? <span className="main-op-badge" title={`Mapped from ${row.routeAnalysis?.nextStOperation || "ST operation"}`}>{row.nextMainOperation.label}</span> : <span className="muted">Unmapped</span>;
+      case "nextPlan": return row.nextPlanningOperation ? <span className="planning-op-badge" style={row.nextPlanningOperation.color ? { borderColor: row.nextPlanningOperation.color } : undefined} title={`Planning order ${row.nextPlanningOperation.planningOrder}`}>{row.nextPlanningOperation.label}<small>{row.nextPlanningOperation.code}</small></span> : <span className="muted">No mapped planning step</span>;
+      case "planningArea": return row.nextPlanningOperation ? <div className="hierarchy-cell"><strong>{row.nextPlanningOperation.scheduleArea?.label || row.nextPlanningOperation.physicalArea?.label || "—"}</strong><small>{row.nextPlanningOperation.stGroup?.label || "No ST Group"}</small></div> : <span className="muted">—</span>;
+      case "planner": return row.nextPlanningOperation?.planner?.label || <span className="muted">—</span>;
+      case "unmapped": return row.unmappedStOperations?.length ? <div className="unmapped-chip-row">{row.unmappedStOperations.slice(0,3).map((x) => <span key={x}>{x}</span>)}{row.unmappedStOperations.length > 3 ? <b>+{row.unmappedStOperations.length-3}</b> : null}</div> : <span className="state-pill good">MAPPED</span>;
       case "remainingSt": return row.routeAnalysis?.remainingStRoute?.length ? <div className="planning-st-route" title={`${row.routeAnalysis.remainingStCount} remaining ST operations`}>{row.routeAnalysis.remainingStRoute.slice(0, 5).map((op) => <span key={`${op.position}-${op.code}`}>{op.code}</span>)}{row.routeAnalysis.remainingStRoute.length > 5 ? <b>+{row.routeAnalysis.remainingStRoute.length - 5}</b> : null}</div> : <span className="muted">{row.routeAnalysis?.stScopeAvailable ? "Complete" : "No ST scope"}</span>;
       case "remainingMain": return row.remainingMainOperations?.length ? <div className="planning-main-route">{row.remainingMainOperations.slice(0,5).map((op) => <span key={op.code}>{op.label}</span>)}{row.remainingMainOperations.length > 5 ? <b>+{row.remainingMainOperations.length - 5}</b> : null}</div> : <span className="muted">Unmapped</span>;
       case "prodQty": return fmt(row.prod_qty);
