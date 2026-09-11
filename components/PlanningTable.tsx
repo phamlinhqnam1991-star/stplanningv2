@@ -45,13 +45,15 @@ type PlanningRow = {
   route_id: string | null;
   route_operation_count: number | null;
   routeAnalysis: RouteAnalysis | null;
+  nextMainOperation: { code: string; label: string } | null;
+  remainingMainOperations: Array<{ code: string; label: string; sourceOperation: string }>;
 };
 
 type PlanningSummary = { total: number; totalQty: number; totalSurface: number; programs: number; priorityRows: number };
 type Meta = { programs: string[]; nextOperations: string[]; operations: string[]; priorities: string[] };
 type SortKey = "row" | "program" | "part" | "revision" | "job" | "nextOperation" | "prodQty" | "goodWip" | "surface" | "priority";
 type Direction = "asc" | "desc";
-type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "routePos" | "nextSt" | "remainingSt" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
+type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "routePos" | "nextSt" | "nextMain" | "remainingSt" | "remainingMain" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
 
 type ViewState = {
   search: string;
@@ -66,6 +68,10 @@ type ViewState = {
 };
 
 type SavedView = { name: string; state: ViewState };
+type BootstrapConfig = {
+  settings?: Record<string, unknown>;
+  views?: Array<{ viewKey: string; isDefault: boolean; config: Record<string, unknown> }>;
+};
 
 const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num" }[] = [
   { key: "row", label: "Row", sort: "row" },
@@ -79,7 +85,9 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "lastOp", label: "Last Operation" },
   { key: "routePos", label: "Route Position" },
   { key: "nextSt", label: "Next ST Operation" },
+  { key: "nextMain", label: "Next Main Operation" },
   { key: "remainingSt", label: "Remaining ST Route" },
+  { key: "remainingMain", label: "Remaining Main Route" },
   { key: "prodQty", label: "Prod Qty", sort: "prodQty", align: "num" },
   { key: "goodWip", label: "Good WIP", sort: "goodWip", align: "num" },
   { key: "surface", label: "Surface dm²", sort: "surface", align: "num" },
@@ -91,7 +99,7 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "operations", label: "ST Operations" },
 ];
 
-const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "routePos", "nextSt", "remainingSt", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale"];
+const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "routePos", "nextSt", "nextMain", "remainingSt", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale"];
 const STORAGE_KEY = "st-planning.phase2.saved-views.v2";
 const CURRENT_KEY = "st-planning.phase2.current-view.v2";
 
@@ -119,6 +127,7 @@ export function PlanningTable() {
   const [sort, setSort] = useState<SortKey>("row");
   const [direction, setDirection] = useState<Direction>("asc");
   const [pageSize, setPageSize] = useState(100);
+  const [maxPageSize, setMaxPageSize] = useState(500);
   const [visibleColumns, setVisibleColumns] = useState<ColumnKey[]>(DEFAULT_COLUMNS);
   const [savedViews, setSavedViews] = useState<SavedView[]>([]);
   const [loading, setLoading] = useState(true);
@@ -126,10 +135,23 @@ export function PlanningTable() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]") as SavedView[];
-      setSavedViews(Array.isArray(saved) ? saved : []);
-      const current = JSON.parse(localStorage.getItem(CURRENT_KEY) || "null") as ViewState | null;
+    let cancelled = false;
+    void (async () => {
+      let current: ViewState | null = null;
+      try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]") as SavedView[];
+        setSavedViews(Array.isArray(saved) ? saved : []);
+        current = JSON.parse(localStorage.getItem(CURRENT_KEY) || "null") as ViewState | null;
+      } catch { /* ignore corrupt browser state */ }
+
+      let cfg: BootstrapConfig | null = null;
+      try { cfg = await apiJson<BootstrapConfig>("/api/config/bootstrap", { cache: "no-store" }); } catch { /* fallback below */ }
+      if (cancelled) return;
+
+      const max = Math.max(20, Math.min(1000, Number(cfg?.settings?.["ui.maxPageSize"] || 500)));
+      const configuredDefault = Math.max(20, Math.min(max, Number(cfg?.settings?.["ui.defaultPageSize"] || 100)));
+      setMaxPageSize(max);
+
       if (current) {
         setSearch(current.search || ""); setQueryText(current.search || "");
         setProgram(current.program || "");
@@ -139,10 +161,20 @@ export function PlanningTable() {
         setSort(current.sort || "row");
         setDirection(current.direction || "asc");
         setVisibleColumns(current.visibleColumns?.length ? current.visibleColumns : DEFAULT_COLUMNS);
-        setPageSize(current.pageSize || 100);
+        setPageSize(Math.min(max, Math.max(20, current.pageSize || configuredDefault)));
+      } else {
+        const view = cfg?.views?.find((v) => v.viewKey === "PLANNING" && v.isDefault)?.config || {};
+        const viewColumns = Array.isArray(view.visibleColumns) ? view.visibleColumns.filter((x): x is ColumnKey => ALL_COLUMNS.some((c) => c.key === x)) : [];
+        const viewSort = typeof view.sort === "string" && ALL_COLUMNS.some((c) => c.sort === view.sort) ? view.sort as SortKey : "row";
+        const viewDirection: Direction = view.direction === "desc" ? "desc" : "asc";
+        const viewPageSize = Number(view.pageSize || configuredDefault);
+        setSort(viewSort); setDirection(viewDirection);
+        setVisibleColumns(viewColumns.length ? viewColumns : DEFAULT_COLUMNS);
+        setPageSize(Math.min(max, Math.max(20, Number.isFinite(viewPageSize) ? viewPageSize : configuredDefault)));
       }
-    } catch { /* ignore corrupt browser state */ }
-    setReady(true);
+      setReady(true);
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -175,6 +207,11 @@ export function PlanningTable() {
   }, [ready, pageSize, offset, queryText, program, nextOperation, operation, priority, sort, direction]);
 
   useEffect(() => { load(); }, [load]);
+
+  const pageSizeOptions = useMemo(() => {
+    const values = [25, 50, 100, 200, 500, pageSize].filter((n) => n <= maxPageSize && n >= 20);
+    return [...new Set(values)].sort((a, b) => a - b);
+  }, [maxPageSize, pageSize]);
 
   function applySearch(e: React.FormEvent) {
     e.preventDefault();
@@ -235,7 +272,9 @@ export function PlanningTable() {
       case "lastOp": return row.last_labor_op || "—";
       case "routePos": return row.routeAnalysis ? <span className="route-position-badge" title={row.routeAnalysis.positionSource.replaceAll("_", " ")}>{row.routeAnalysis.currentPosition ? `${row.routeAnalysis.currentPosition}/${row.route_operation_count || "?"}` : "COMPLETE"}</span> : <span className="muted">No route</span>;
       case "nextSt": return row.routeAnalysis?.nextStOperation ? <span className="next-st-badge" title={row.routeAnalysis.nextStSequence != null ? `OprSeq ${row.routeAnalysis.nextStSequence}` : undefined}>{row.routeAnalysis.nextStOperation}</span> : <span className="muted">—</span>;
+      case "nextMain": return row.nextMainOperation ? <span className="main-op-badge" title={`Mapped from ${row.routeAnalysis?.nextStOperation || "ST operation"}`}>{row.nextMainOperation.label}</span> : <span className="muted">Unmapped</span>;
       case "remainingSt": return row.routeAnalysis?.remainingStRoute?.length ? <div className="planning-st-route" title={`${row.routeAnalysis.remainingStCount} remaining ST operations`}>{row.routeAnalysis.remainingStRoute.slice(0, 5).map((op) => <span key={`${op.position}-${op.code}`}>{op.code}</span>)}{row.routeAnalysis.remainingStRoute.length > 5 ? <b>+{row.routeAnalysis.remainingStRoute.length - 5}</b> : null}</div> : <span className="muted">{row.routeAnalysis?.stScopeAvailable ? "Complete" : "No ST scope"}</span>;
+      case "remainingMain": return row.remainingMainOperations?.length ? <div className="planning-main-route">{row.remainingMainOperations.slice(0,5).map((op) => <span key={op.code}>{op.label}</span>)}{row.remainingMainOperations.length > 5 ? <b>+{row.remainingMainOperations.length - 5}</b> : null}</div> : <span className="muted">Unmapped</span>;
       case "prodQty": return fmt(row.prod_qty);
       case "goodWip": return fmt(row.current_good_wip_qty);
       case "surface": return fmt(row.surface_dm2, 2);
@@ -290,7 +329,7 @@ export function PlanningTable() {
         <label><span>Next Operation</span><select value={nextOperation} onChange={(e) => { setNextOperation(e.target.value); setOffset(0); }}><option value="">All Next Operations</option>{meta.nextOperations.map((x) => <option key={x}>{x}</option>)}</select></label>
         <label><span>ST Operation Present</span><select value={operation} onChange={(e) => { setOperation(e.target.value); setOffset(0); }}><option value="">Any Operation</option>{meta.operations.map((x) => <option key={x}>{x}</option>)}</select></label>
         <label><span>Priority Contains</span><select value={priority} onChange={(e) => { setPriority(e.target.value); setOffset(0); }}><option value="">All Priority Values</option>{meta.priorities.map((x) => <option key={x}>{x}</option>)}</select></label>
-        <label className="small-control"><span>Rows / Page</span><select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setOffset(0); }}><option>50</option><option>100</option><option>200</option><option>500</option></select></label>
+        <label className="small-control"><span>Rows / Page</span><select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setOffset(0); }}>{pageSizeOptions.map((n) => <option key={n} value={n}>{n}</option>)}</select></label>
         <div className="record-count"><strong>{summary.total.toLocaleString()}</strong><span>matching rows</span></div>
       </div>
 

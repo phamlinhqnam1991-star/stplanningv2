@@ -1,12 +1,17 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
-import { SOURCE_SHEETS } from "@/lib/source-model";
+import { getSourceProfile, sourceDisplayColumns } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
+    const profile = await getSourceProfile("PLANNING");
+    const sheetName = profile.sheetName || profile.displayName;
+    const display = sourceDisplayColumns(profile);
+    const cols = [display.priorityType || "CM", display.catTransit || "CN", display.impactSaleValue || "CO"];
+
     const programs = await query<{ value: string }>(
       `SELECT DISTINCT program AS value FROM v_active_planning_jobs
        WHERE NULLIF(program,'') IS NOT NULL ORDER BY value LIMIT 300`
@@ -21,24 +26,10 @@ export async function GET() {
        JOIN v_active_planning_jobs p ON p.id=o.planning_job_id
        WHERE NULLIF(o.operation_code,'') IS NOT NULL ORDER BY value LIMIT 500`
     );
+    const prioritySql = cols.map((col) => `SELECT rr.row_data->'${col}'->>'v' AS value FROM raw_sheet_rows rr JOIN import_runs i ON i.id=rr.import_id WHERE i.is_active=true AND i.status='COMPLETED' AND rr.sheet_name=$1 AND rr.source_row_no > $2`).join(" UNION ");
     const priorities = await query<{ value: string }>(
-      `SELECT DISTINCT value FROM (
-         SELECT rr.row_data->'CM'->>'v' AS value
-         FROM raw_sheet_rows rr
-         JOIN import_runs i ON i.id=rr.import_id
-         WHERE i.is_active=true AND i.status='COMPLETED' AND rr.sheet_name=$1 AND rr.source_row_no > 3
-         UNION
-         SELECT rr.row_data->'CN'->>'v' AS value
-         FROM raw_sheet_rows rr
-         JOIN import_runs i ON i.id=rr.import_id
-         WHERE i.is_active=true AND i.status='COMPLETED' AND rr.sheet_name=$1 AND rr.source_row_no > 3
-         UNION
-         SELECT rr.row_data->'CO'->>'v' AS value
-         FROM raw_sheet_rows rr
-         JOIN import_runs i ON i.id=rr.import_id
-         WHERE i.is_active=true AND i.status='COMPLETED' AND rr.sheet_name=$1 AND rr.source_row_no > 3
-       ) x WHERE NULLIF(value,'') IS NOT NULL ORDER BY value LIMIT 300`,
-      [SOURCE_SHEETS.planning.name]
+      `SELECT DISTINCT value FROM (${prioritySql}) x WHERE NULLIF(value,'') IS NOT NULL ORDER BY value LIMIT 300`,
+      [sheetName, profile.headerRows]
     );
     return NextResponse.json({
       programs: programs.rows.map((r) => r.value),

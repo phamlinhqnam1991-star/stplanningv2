@@ -3,17 +3,16 @@
 import { apiJson } from "@/lib/api-client";
 import type { ParsedWorkbook, RawRow } from "@/lib/types";
 
-const MAX_ROWS_PER_CHUNK = 100;
 const TARGET_JSON_BYTES = 1_600_000;
 
-function splitRows(rows: RawRow[]): RawRow[][] {
+function splitRows(rows: RawRow[], maxRows: number): RawRow[][] {
   const chunks: RawRow[][] = [];
   let current: RawRow[] = [];
   let bytes = 2;
 
   for (const row of rows) {
     const rowBytes = new Blob([JSON.stringify(row)]).size + 1;
-    if (current.length && (current.length >= MAX_ROWS_PER_CHUNK || bytes + rowBytes > TARGET_JSON_BYTES)) {
+    if (current.length && (current.length >= maxRows || bytes + rowBytes > TARGET_JSON_BYTES)) {
       chunks.push(current);
       current = [];
       bytes = 2;
@@ -36,7 +35,8 @@ export type ImportProgress = {
 export async function importWorkbook(
   workbook: ParsedWorkbook,
   sha256: string,
-  onProgress: (progress: ImportProgress) => void
+  onProgress: (progress: ImportProgress) => void,
+  maxRowsPerChunk = 100
 ): Promise<{ importId: string; validation: unknown }> {
   const totalRows = workbook.sheets.reduce((sum, s) => sum + s.rows.length, 0);
   onProgress({ stage: "STARTING", sentRows: 0, totalRows, percent: 0 });
@@ -60,7 +60,7 @@ export async function importWorkbook(
 
   let sentRows = 0;
   for (const sheet of workbook.sheets) {
-    for (const rows of splitRows(sheet.rows)) {
+    for (const rows of splitRows(sheet.rows, Math.max(1, Math.min(500, maxRowsPerChunk)))) {
       await apiJson<{ inserted: number }>("/api/import/chunk", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

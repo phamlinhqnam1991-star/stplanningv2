@@ -1,10 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { parseWorkbook, type ParseProgress } from "@/lib/excel-parser";
 import { importWorkbook, type ImportProgress } from "@/lib/import-client";
-import type { ParsedWorkbook } from "@/lib/types";
+import type { ParsedWorkbook, ParserConfigBundle, ParserSourceProfile } from "@/lib/types";
+import { apiJson } from "@/lib/api-client";
+
+type BootstrapResponse = { sources: { PLANNING: ParserSourceProfile; SCHEDULING: ParserSourceProfile; ROUTING: ParserSourceProfile }; settings: Record<string, unknown> };
 
 export function ImportConsole() {
   const [parsed, setParsed] = useState<ParsedWorkbook | null>(null);
@@ -14,6 +17,14 @@ export function ImportConsole() {
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [error, setError] = useState("");
   const [complete, setComplete] = useState(false);
+  const [parserConfig, setParserConfig] = useState<ParserConfigBundle | undefined>();
+  const [maxChunkRows, setMaxChunkRows] = useState(100);
+
+  useEffect(() => {
+    apiJson<BootstrapResponse>("/api/config/bootstrap", { cache: "no-store" })
+      .then((data) => { setParserConfig({ planning: data.sources.PLANNING, scheduling: data.sources.SCHEDULING, routing: data.sources.ROUTING }); setMaxChunkRows(Number(data.settings?.["import.maxStChunkRows"] || 100)); })
+      .catch(() => undefined);
+  }, []);
 
   async function chooseFile(file: File | null) {
     if (!file) return;
@@ -26,7 +37,14 @@ export function ImportConsole() {
     setParseProgress({ stage: "READING", percent: 0 });
 
     try {
-      const result = await parseWorkbook(file, setParseProgress);
+      let activeConfig = parserConfig;
+      try {
+        const data = await apiJson<BootstrapResponse>("/api/config/bootstrap", { cache: "no-store" });
+        activeConfig = { planning: data.sources.PLANNING, scheduling: data.sources.SCHEDULING, routing: data.sources.ROUTING };
+        setParserConfig(activeConfig);
+        setMaxChunkRows(Number(data.settings?.["import.maxStChunkRows"] || 100));
+      } catch { /* parser has safe baseline fallback */ }
+      const result = await parseWorkbook(file, setParseProgress, activeConfig);
       setParsed(result.workbook);
       setSha256(result.sha256);
     } catch (e) {
@@ -43,7 +61,7 @@ export function ImportConsole() {
     setError("");
     setComplete(false);
     try {
-      await importWorkbook(parsed, sha256, setProgress);
+      await importWorkbook(parsed, sha256, setProgress, maxChunkRows);
       setComplete(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -71,7 +89,7 @@ export function ImportConsole() {
       <section className="panel intake-panel">
         <div className="panel-head">
           <div><span className="eyebrow">CONTROLLED SOURCE</span><h2>Workbook Intake</h2></div>
-          <span className="badge neutral">2 SHEETS ONLY</span>
+          <span className="badge neutral">CONFIG-DRIVEN SOURCE</span>
         </div>
         <div className="intake-grid">
           <label className="file-zone">

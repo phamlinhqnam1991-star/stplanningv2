@@ -37,13 +37,16 @@ db/03_scheduling.sql         # 7 statements
 db/04_views.sql              # 3 statements
 db/05_routing_core.sql       # 8 statements
 db/06_routing_operations.sql # 7 statements
+db/07_config_core.sql         # 8 statements
+db/08_config_defaults.sql     # 7 statements
+db/09_config_links_seed.sql   # 4 statements
 ```
 
-If your v007 database already exists, run only:
+Upgrade paths:
 
 ```text
-db/05_routing_core.sql
-db/06_routing_operations.sql
+Existing v009: run 07 -> 08 -> 09 only
+Existing v007: run 05 -> 06 -> 07 -> 08 -> 09
 ```
 
 Verification is also split to stay below the same limit:
@@ -110,10 +113,16 @@ The current approved file has 6,499 Jobs and 248 source columns.
 /routing     Full Job Routing
 /planning    Phase 2 Planning
 /scheduling  Phase 3 Scheduling
+/configuration Configuration Center
 ```
 
 ## Design rule
 
 RAW source evidence is immutable. Future business rules are added only to operational/business layers after explicit approval.
 
-See `README_v008.md` and `docs/ROUTING_SOURCE.md` for routing details.
+See `README_v010.md`, `docs/CONFIGURATION_ARCHITECTURE.md`, and `docs/ROUTING_SOURCE.md`.
+
+
+## v010 Configuration-First Extension
+
+Configuration is now the extension layer for source mappings, Main Operations, operation mappings, resources, statuses, areas, planners, recipe groups, runtime settings, shared views and future rule definitions. Existing v009 databases only need SQL 07 → 08 → 09. See `README_v010.md` and `docs/CONFIGURATION_ARCHITECTURE.md`.

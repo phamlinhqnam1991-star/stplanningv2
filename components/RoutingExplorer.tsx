@@ -46,6 +46,13 @@ type RouteRow = {
   st_all_operation: string | null;
   operations: RouteOperation[];
   routeAnalysis: RouteAnalysis;
+  nextMainOperation: { code: string; label: string } | null;
+  remainingMainOperations: Array<{ code: string; label: string; sourceOperation: string }>;
+};
+
+type BootstrapConfig = {
+  settings?: Record<string, unknown>;
+  views?: Array<{ viewKey: string; isDefault: boolean; config: Record<string, unknown> }>;
 };
 
 type ResponseData = {
@@ -69,20 +76,27 @@ export function RoutingExplorer() {
   const [search, setSearch] = useState("");
   const [operation, setOperation] = useState("");
   const [offset, setOffset] = useState(0);
+  const [pageSize, setPageSize] = useState(25);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
     const initial = new URLSearchParams(window.location.search).get("search");
     if (initial) setSearch(initial);
+    apiJson<BootstrapConfig>("/api/config/bootstrap", { cache: "no-store" }).then((cfg) => {
+      const view = cfg.views?.find((v) => v.viewKey === "ROUTING" && v.isDefault)?.config || {};
+      const max = Math.max(10, Math.min(500, Number(cfg.settings?.["ui.maxPageSize"] || 500)));
+      const configured = Number(view.pageSize || 25);
+      setPageSize(Math.min(max, Math.max(10, Number.isFinite(configured) ? configured : 25)));
+    }).catch(() => undefined);
   }, []);
 
   const query = useMemo(() => {
-    const p = new URLSearchParams({ limit: "25", offset: String(offset), sort: "job", direction: "asc" });
+    const p = new URLSearchParams({ limit: String(pageSize), offset: String(offset), sort: "job", direction: "asc" });
     if (search.trim()) p.set("search", search.trim());
     if (operation.trim()) p.set("operation", operation.trim());
     return p.toString();
-  }, [search, operation, offset]);
+  }, [search, operation, offset, pageSize]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -96,17 +110,17 @@ export function RoutingExplorer() {
     return () => window.clearTimeout(timer);
   }, [query]);
 
-  const page = Math.floor(offset / 25) + 1;
-  const pages = Math.max(1, Math.ceil((data?.total ?? 0) / 25));
+  const page = Math.floor(offset / pageSize) + 1;
+  const pages = Math.max(1, Math.ceil((data?.total ?? 0) / pageSize));
 
   return (
     <div className="stack">
       <div className="kpi-grid route-kpis route-kpis-6">
         <div className="kpi-card"><span>ACTIVE JOB ROUTES</span><strong>{(data?.summary.total ?? 0).toLocaleString()}</strong><small>JobNum-grain route snapshot</small></div>
-        <div className="kpi-card"><span>OPERATION ROWS</span><strong>{(data?.summary.operations ?? 0).toLocaleString()}</strong><small>Op.1…Op.36 normalized</small></div>
+        <div className="kpi-card"><span>OPERATION ROWS</span><strong>{(data?.summary.operations ?? 0).toLocaleString()}</strong><small>Normalized route operations</small></div>
         <div className="kpi-card"><span>PROGRAMS</span><strong>{data?.summary.programs ?? 0}</strong><small>Current routing source</small></div>
         <div className="kpi-card"><span>WITH NEXT OP</span><strong>{(data?.summary.withNext ?? 0).toLocaleString()}</strong><small>Source NextOperation retained</small></div>
-        <div className="kpi-card route-analysis-kpi"><span>PAGE ST SCOPE</span><strong>{data?.summary.pageWithStScope ?? 0}/25</strong><small>Joined to Planning AllOperation</small></div>
+        <div className="kpi-card route-analysis-kpi"><span>PAGE ST SCOPE</span><strong>{data?.summary.pageWithStScope ?? 0}/{pageSize}</strong><small>Joined to Planning AllOperation</small></div>
         <div className="kpi-card route-analysis-kpi"><span>PAGE NEXT ST</span><strong>{data?.summary.pageWithNextSt ?? 0}</strong><small>Derived from remaining route</small></div>
       </div>
 
@@ -146,8 +160,8 @@ export function RoutingExplorer() {
                         <div className="route-analysis-line"><span>POSITION</span><strong>{a.currentPosition ? `${a.currentPosition}/${row.operation_count}` : "COMPLETE"}</strong><small>{a.positionSource.replaceAll("_", " ")}</small></div>
                         <div className="route-analysis-line"><span>REMAINING</span><strong>{a.remainingCount}</strong><small>operations</small></div>
                         <div className="route-analysis-line st"><span>REMAINING ST</span><strong>{a.stScopeAvailable ? a.remainingStCount : "—"}</strong><small>{a.stScopeAvailable ? "Planning scope" : "No Planning match"}</small></div>
-                        <div className="next-st-box"><span>NEXT ST</span><strong>{a.nextStOperation || "—"}</strong>{a.nextStSequence != null ? <small>Seq {a.nextStSequence}</small> : null}</div>
-                        {a.remainingStRoute.length ? <div className="remaining-st-strip">{a.remainingStRoute.map((op) => <span key={`st-${row.id}-${op.position}`} title={`Position ${op.position} · Seq ${op.sequence ?? "—"}`}>{op.code}</span>)}</div> : null}
+                        <div className="next-st-box"><span>NEXT ST</span><strong>{a.nextStOperation || "—"}</strong>{a.nextStSequence != null ? <small>Seq {a.nextStSequence}</small> : null}</div><div className="next-main-box"><span>NEXT MAIN</span><strong>{row.nextMainOperation?.label || "UNMAPPED"}</strong>{row.nextMainOperation ? <small>{row.nextMainOperation.code}</small> : null}</div>
+                        {a.remainingStRoute.length ? <div className="remaining-st-strip">{a.remainingStRoute.map((op) => <span key={`st-${row.id}-${op.position}`} title={`Position ${op.position} · Seq ${op.sequence ?? "—"}`}>{op.code}</span>)}</div> : null}{row.remainingMainOperations?.length ? <div className="remaining-main-strip">{row.remainingMainOperations.map((op) => <span key={`main-${row.id}-${op.code}`}>{op.label}</span>)}</div> : null}
                       </div>
                     </td>
                     <td>
@@ -169,9 +183,9 @@ export function RoutingExplorer() {
           </table>
         </div>
         <div className="pager">
-          <button className="button" disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - 25))}>Previous</button>
+          <button className="button" disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button>
           <span>Page {page} / {pages}</span>
-          <button className="button" disabled={page >= pages || loading} onClick={() => setOffset(offset + 25)}>Next</button>
+          <button className="button" disabled={page >= pages || loading} onClick={() => setOffset(offset + pageSize)}>Next</button>
         </div>
       </section>
     </div>

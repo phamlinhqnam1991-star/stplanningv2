@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
 import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
+import { applyMainOperationMapping, getConfigBootstrap, getOperationMainMap, numberSetting, routeConfigOptionsFromSettings } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,7 +37,13 @@ type RoutingDbRow = {
 export async function GET(request: Request) {
   try {
     const url = new URL(request.url);
-    const limit = Math.min(200, Math.max(10, Number(url.searchParams.get("limit") || 25)));
+    const bootstrap = await getConfigBootstrap();
+    const routeOptions = routeConfigOptionsFromSettings(bootstrap.settings);
+    const mainOperationMap = await getOperationMainMap();
+    const defaultView = bootstrap.views.find((v) => v.viewKey === "ROUTING" && v.isDefault)?.config || {};
+    const defaultPageSize = numberSetting({ ...bootstrap.settings, "routing.defaultPageSize": defaultView.pageSize }, "routing.defaultPageSize", 25, 10, 500);
+    const maxPageSize = numberSetting(bootstrap.settings, "ui.maxPageSize", 500, 10, 1000);
+    const limit = Math.min(maxPageSize, Math.max(10, Number(url.searchParams.get("limit") || defaultPageSize)));
     const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
     const search = (url.searchParams.get("search") || "").trim();
     const operation = (url.searchParams.get("operation") || "").trim();
@@ -116,10 +123,15 @@ export async function GET(request: Request) {
       rowParams
     );
 
-    const analyzedRows = rows.rows.map((row: RoutingDbRow) => ({
-      ...row,
-      routeAnalysis: analyzeRoute(row.operations, row.next_operation, row.st_all_operation),
-    }));
+    const analyzedRows = rows.rows.map((row: RoutingDbRow) => {
+      const routeAnalysis = analyzeRoute(row.operations, row.next_operation, row.st_all_operation, routeOptions);
+      return {
+        ...row,
+        routeAnalysis,
+        nextMainOperation: routeAnalysis.nextStOperation ? mainOperationMap[routeAnalysis.nextStOperation.toUpperCase()] ?? null : null,
+        remainingMainOperations: applyMainOperationMapping(routeAnalysis.remainingStRoute.map((op) => op.code), mainOperationMap),
+      };
+    });
 
     const s = summary.rows[0] || { total: 0, programs: 0, operations: 0, with_next: 0 };
     const pageWithStScope = analyzedRows.filter((row: RoutingDbRow & { routeAnalysis: ReturnType<typeof analyzeRoute> }) => row.routeAnalysis.stScopeAvailable).length;

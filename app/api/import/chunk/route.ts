@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { withTransaction } from "@/lib/db";
-import { SOURCE_SHEETS, SCHEDULING_RESOURCE_COLUMNS } from "@/lib/source-model";
+import { excelColumnNumber } from "@/lib/source-model";
+import { sourceCoreColumns, sourceOperationRange, sourceResourceColumns, type SourceProfile } from "@/lib/config";
 import { asInteger, asNumber, asText, excelDurationToMinutes, excelFractionToTime, excelSerialToDate, isNonBlank, rawValue } from "@/lib/normalize";
 import type { RawRow } from "@/lib/types";
 
@@ -23,7 +24,7 @@ const rowSchema = z.object({
 const bodySchema = z.object({
   importId: z.string().uuid(),
   sheetKey: z.enum(["planning", "scheduling"]),
-  rows: z.array(rowSchema).min(1).max(100),
+  rows: z.array(rowSchema).min(1).max(500),
 });
 
 function bulkValues(rows: unknown[][]) {
@@ -39,7 +40,6 @@ function bulkValues(rows: unknown[][]) {
 export async function POST(request: Request) {
   try {
     const body = bodySchema.parse(await request.json());
-    const sheetConfig = SOURCE_SHEETS[body.sheetKey];
     const rows = body.rows as RawRow[];
 
     if (new Set(rows.map((r) => r.rowNo)).size !== rows.length) {
@@ -51,25 +51,33 @@ export async function POST(request: Request) {
         status: string;
         planning_row_count: number;
         scheduling_row_count: number;
+        config_snapshot: unknown;
       }>(
-        `SELECT status, planning_row_count, scheduling_row_count
+        `SELECT status, planning_row_count, scheduling_row_count, config_snapshot
          FROM import_runs WHERE id = $1 FOR UPDATE`,
         [body.importId]
       );
       if (!run.rowCount) throw new Error("Import run not found.");
       if (run.rows[0].status !== "IMPORTING") throw new Error("Import run is no longer accepting chunks.");
+      const snapshot = run.rows[0].config_snapshot as { planning?: SourceProfile; scheduling?: SourceProfile; settings?: Record<string, unknown> } | null;
+      const sheetConfig = body.sheetKey === "planning" ? snapshot?.planning : snapshot?.scheduling;
+      if (!sheetConfig) throw new Error("Import run has no configuration snapshot. Restart the import with the current version.");
+      const configuredMaxRows = Math.max(1, Math.min(500, Number(snapshot?.settings?.["import.maxStChunkRows"] || 100)));
+      if (rows.length > configuredMaxRows) throw new Error(`Chunk exceeds configured ST import limit of ${configuredMaxRows} rows.`);
+      const sheetName = sheetConfig.sheetName || sheetConfig.displayName;
+      const core = sourceCoreColumns(sheetConfig);
 
       const expectedRows = body.sheetKey === "planning"
         ? run.rows[0].planning_row_count
         : run.rows[0].scheduling_row_count;
       if (rows.some((r) => r.rowNo > expectedRows)) {
-        throw new Error(`Chunk contains a row outside the ${sheetConfig.name} used range.`);
+        throw new Error(`Chunk contains a row outside the ${sheetName} used range.`);
       }
 
       const rawRows = rows.map((row) => {
         const payload = JSON.stringify(row.cells);
         const hash = createHash("sha256").update(payload).digest("hex");
-        return [body.importId, sheetConfig.name, row.rowNo, payload, hash];
+        return [body.importId, sheetName, row.rowNo, payload, hash];
       });
       const rawBulk = bulkValues(rawRows);
       await client.query(
@@ -81,7 +89,7 @@ export async function POST(request: Request) {
       );
 
       if (body.sheetKey === "planning") {
-        const dataRows = rows.filter((r) => r.rowNo > SOURCE_SHEETS.planning.headerRows);
+        const dataRows = rows.filter((r) => r.rowNo > sheetConfig.headerRows);
         if (dataRows.length) {
           const sourceNos = dataRows.map((r) => r.rowNo);
           await client.query(
@@ -92,21 +100,21 @@ export async function POST(request: Request) {
           const jobRows = dataRows.map((row) => [
             body.importId,
             row.rowNo,
-            asText(rawValue(row, "A")),
-            asText(rawValue(row, "B")),
-            asText(rawValue(row, "C")),
-            asNumber(rawValue(row, "D")),
-            asText(rawValue(row, "E")),
-            asText(rawValue(row, "F")),
-            asText(rawValue(row, "G")),
-            asText(rawValue(row, "H")),
-            asNumber(rawValue(row, "I")),
-            asNumber(rawValue(row, "J")),
-            asNumber(rawValue(row, "K")),
-            asText(rawValue(row, "AW")),
-            asText(rawValue(row, "AX")),
-            asText(rawValue(row, "AY")),
-            asText(rawValue(row, "AZ")),
+            asText(rawValue(row, core.program || "A")),
+            asText(rawValue(row, core.partCluster || "B")),
+            asText(rawValue(row, core.epicorPart || "C")),
+            asNumber(rawValue(row, core.surfaceDm2 || "D")),
+            asText(rawValue(row, core.partDescription || "E")),
+            asText(rawValue(row, core.jobNum || "F")),
+            asText(rawValue(row, core.lastLaborOp || "G")),
+            asText(rawValue(row, core.nextOperation || "H")),
+            asNumber(rawValue(row, core.lastLaborQty || "I")),
+            asNumber(rawValue(row, core.prodQty || "J")),
+            asNumber(rawValue(row, core.currentGoodWipQty || "K")),
+            asText(rawValue(row, core.stSourceValue || "AW")),
+            asText(rawValue(row, core.stWipArea || "AX")),
+            asText(rawValue(row, core.wipSequence || "AY")),
+            asText(rawValue(row, core.allOperation || "AZ")),
           ]);
           const jobsBulk = bulkValues(jobRows);
           const insertedJobs = await client.query<{ id: string; source_row_no: number }>(
@@ -127,9 +135,9 @@ export async function POST(request: Request) {
           }>(
             `SELECT column_order, excel_column, header_row_3
              FROM source_columns
-             WHERE import_id = $1 AND sheet_name = $2 AND column_order BETWEEN 13 AND 48
+             WHERE import_id = $1 AND sheet_name = $2 AND column_order BETWEEN $3 AND $4
              ORDER BY column_order`,
-            [body.importId, SOURCE_SHEETS.planning.name]
+            [body.importId, sheetName, sourceOperationRange(sheetConfig).start, sourceOperationRange(sheetConfig).end]
           );
 
           const opRows: unknown[][] = [];
@@ -153,7 +161,7 @@ export async function POST(request: Request) {
           }
         }
       } else {
-        const dataRows = rows.filter((r) => r.rowNo > SOURCE_SHEETS.scheduling.headerRows);
+        const dataRows = rows.filter((r) => r.rowNo > sheetConfig.headerRows);
         if (dataRows.length) {
           const sourceNos = dataRows.map((r) => r.rowNo);
           await client.query(
@@ -164,20 +172,20 @@ export async function POST(request: Request) {
           const blockRows = dataRows.map((row) => [
             body.importId,
             row.rowNo,
-            excelSerialToDate(rawValue(row, "A")),
-            asText(rawValue(row, "B")),
-            asInteger(rawValue(row, "C")),
-            asText(rawValue(row, "Q")),
-            asText(rawValue(row, "R")),
-            asText(rawValue(row, "S")),
-            asInteger(rawValue(row, "T")),
-            asNumber(rawValue(row, "U")),
-            asNumber(rawValue(row, "V")),
-            excelFractionToTime(rawValue(row, "W")),
-            excelFractionToTime(rawValue(row, "X")),
-            excelDurationToMinutes(rawValue(row, "Y")),
-            asText(rawValue(row, "AJ")),
-            asText(rawValue(row, "AK")),
+            excelSerialToDate(rawValue(row, core.date || "A")),
+            asText(rawValue(row, core.day || "B")),
+            asInteger(rawValue(row, core.slot || "C")),
+            asText(rawValue(row, core.batch || "Q")),
+            asText(rawValue(row, core.recipeNo || "R")),
+            asText(rawValue(row, core.recipeDescription || "S")),
+            asInteger(rawValue(row, core.jobCount || "T")),
+            asNumber(rawValue(row, core.pcs || "U")),
+            asNumber(rawValue(row, core.surfaceDm2 || "V")),
+            excelFractionToTime(rawValue(row, core.start || "W")),
+            excelFractionToTime(rawValue(row, core.end || "X")),
+            excelDurationToMinutes(rawValue(row, core.duration || "Y")),
+            asText(rawValue(row, core.status || "AJ")),
+            asText(rawValue(row, core.comments || "AK")),
           ]);
           const blocksBulk = bulkValues(blockRows);
           const insertedBlocks = await client.query<{ id: string; source_row_no: number }>(
@@ -195,9 +203,8 @@ export async function POST(request: Request) {
           for (const row of dataRows) {
             const blockId = blockIds.get(row.rowNo);
             if (!blockId) continue;
-            for (const [orderText, resourceCode] of Object.entries(SCHEDULING_RESOURCE_COLUMNS)) {
-              const order = Number(orderText);
-              const col = String.fromCharCode(64 + order);
+            for (const [col, resourceCode] of Object.entries(sourceResourceColumns(sheetConfig))) {
+              const order = excelColumnNumber(col);
               const value = rawValue(row, col);
               if (!isNonBlank(value)) continue;
               assignmentRows.push([blockId, resourceCode, order, col, String(value)]);

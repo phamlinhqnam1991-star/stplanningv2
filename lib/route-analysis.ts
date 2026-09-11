@@ -7,6 +7,12 @@ export type RouteOperationForAnalysis = {
   sourceText?: string;
 };
 
+export type RouteAnalysisOptions = {
+  preferNextOperation?: boolean;
+  fallbackFirstIncomplete?: boolean;
+  includeCurrentInRemaining?: boolean;
+};
+
 export type RouteAnalysis = {
   routeMatched: boolean;
   currentPosition: number | null;
@@ -46,13 +52,17 @@ export function parseStScope(allOperation: string | null | undefined): string[] 
 export function analyzeRoute(
   operations: RouteOperationForAnalysis[] | null | undefined,
   nextOperation: string | null | undefined,
-  allOperation: string | null | undefined
+  allOperation: string | null | undefined,
+  options: RouteAnalysisOptions = {}
 ): RouteAnalysis {
   const ops = [...(operations || [])]
     .filter((op) => Boolean(op && op.code))
     .sort((a, b) => a.position - b.position);
 
   const completedCount = ops.filter((op) => op.complete === true).length;
+  const preferNextOperation = options.preferNextOperation !== false;
+  const fallbackFirstIncomplete = options.fallbackFirstIncomplete !== false;
+  const includeCurrentInRemaining = options.includeCurrentInRemaining !== false;
   const stScopeCodes = parseStScope(allOperation);
   const stScopeSet = new Set(stScopeCodes.map(norm));
 
@@ -79,13 +89,13 @@ export function analyzeRoute(
   let currentIndex = -1;
   let positionSource: RouteAnalysis["positionSource"] = "COMPLETE";
 
-  if (nextKey) {
+  if (nextKey && preferNextOperation) {
     currentIndex = ops.findIndex((op) => norm(op.code) === nextKey && op.complete !== true);
     if (currentIndex < 0) currentIndex = ops.findIndex((op) => norm(op.code) === nextKey);
     if (currentIndex >= 0) positionSource = "NEXT_OPERATION";
   }
 
-  if (currentIndex < 0) {
+  if (currentIndex < 0 && fallbackFirstIncomplete) {
     currentIndex = ops.findIndex((op) => op.complete !== true);
     if (currentIndex >= 0) positionSource = "FIRST_INCOMPLETE";
   }
@@ -110,7 +120,7 @@ export function analyzeRoute(
   }
 
   const current = ops[currentIndex];
-  const remainingRoute = ops.slice(currentIndex);
+  const remainingRoute = ops.slice(includeCurrentInRemaining ? currentIndex : currentIndex + 1);
   const remainingStRoute = stScopeSet.size
     ? remainingRoute.filter((op) => stScopeSet.has(norm(op.code)))
     : [];

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { withTransaction } from "@/lib/db";
-import { ROUTING_SOURCE } from "@/lib/source-model";
+import type { SourceProfile } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,13 +17,17 @@ export async function POST(request: Request) {
         status: string;
         route_row_count: number;
         route_column_count: number;
+        config_snapshot: unknown;
       }>(
-        `SELECT status, route_row_count, route_column_count
+        `SELECT status, route_row_count, route_column_count, config_snapshot
          FROM route_import_runs WHERE id=$1 FOR UPDATE`,
         [importId]
       );
       if (!run.rowCount) throw new Error("Routing import run not found.");
       if (run.rows[0].status !== "IMPORTING") throw new Error("Routing import is not in IMPORTING status.");
+      const snapshot = run.rows[0].config_snapshot as { routing?: SourceProfile } | null;
+      const routingProfile = snapshot?.routing;
+      if (!routingProfile) throw new Error("Routing import has no configuration snapshot. Restart the import.");
 
       const counts = await client.query<{
         raw_rows: number;
@@ -57,7 +61,7 @@ export async function POST(request: Request) {
 
       const actual = counts.rows[0];
       const expectedRaw = run.rows[0].route_row_count;
-      const expectedJobs = Math.max(0, expectedRaw - ROUTING_SOURCE.headerRows);
+      const expectedJobs = Math.max(0, expectedRaw - routingProfile.headerRows);
       const issues: string[] = [];
       if (actual.raw_rows !== expectedRaw) issues.push(`RAW rows ${actual.raw_rows}/${expectedRaw}`);
       if (actual.source_columns !== run.rows[0].route_column_count) issues.push(`Source columns ${actual.source_columns}/${run.rows[0].route_column_count}`);
@@ -86,6 +90,20 @@ export async function POST(request: Request) {
             : 100,
         };
       }
+
+      await client.query(
+        `INSERT INTO config_items (category, code, label, sort_order, data)
+         SELECT 'OPERATION_CODE', o.operation_code, o.operation_code,
+                min(o.operation_position)::int,
+                jsonb_build_object('discoveredFrom','ROUTING','lastImportId',$1::text)
+         FROM job_operation_sequence o
+         JOIN job_routes j ON j.id=o.job_route_id
+         WHERE j.import_id=$1 AND NULLIF(o.operation_code,'') IS NOT NULL
+         GROUP BY o.operation_code
+         ON CONFLICT (category,code) DO UPDATE SET
+           data=config_items.data || EXCLUDED.data, updated_at=now()`,
+        [importId]
+      );
 
       await client.query(`UPDATE route_import_runs SET is_active=false WHERE is_active=true AND id<>$1`, [importId]);
       await client.query(

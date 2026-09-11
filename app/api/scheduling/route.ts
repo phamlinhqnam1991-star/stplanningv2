@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
+import { getConfigBootstrap, numberSetting } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,7 +26,10 @@ function addLike(params: unknown[], value: string) {
 export async function GET(request: Request) {
   try {
     const url = new URL(request.url);
-    const limit = Math.min(1000, Math.max(20, Number(url.searchParams.get("limit") || 100)));
+    const bootstrap = await getConfigBootstrap();
+    const defaultPageSize = numberSetting(bootstrap.settings, "ui.defaultPageSize", 100, 20, 1000);
+    const maxPageSize = numberSetting(bootstrap.settings, "ui.maxPageSize", 500, 20, 1000);
+    const limit = Math.min(maxPageSize, Math.max(20, Number(url.searchParams.get("limit") || defaultPageSize)));
     const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
     const search = (url.searchParams.get("search") || "").trim();
     const status = (url.searchParams.get("status") || "").trim();

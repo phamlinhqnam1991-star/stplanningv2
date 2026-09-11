@@ -3,17 +3,16 @@
 import { apiJson } from "@/lib/api-client";
 import type { ParsedRoutingWorkbook, RawRow } from "@/lib/types";
 
-const MAX_ROWS_PER_CHUNK = 80;
 const TARGET_JSON_BYTES = 1_600_000;
 
-function splitRows(rows: RawRow[]): RawRow[][] {
+function splitRows(rows: RawRow[], maxRows: number): RawRow[][] {
   const chunks: RawRow[][] = [];
   let current: RawRow[] = [];
   let bytes = 2;
 
   for (const row of rows) {
     const rowBytes = new Blob([JSON.stringify(row)]).size + 1;
-    if (current.length && (current.length >= MAX_ROWS_PER_CHUNK || bytes + rowBytes > TARGET_JSON_BYTES)) {
+    if (current.length && (current.length >= maxRows || bytes + rowBytes > TARGET_JSON_BYTES)) {
       chunks.push(current);
       current = [];
       bytes = 2;
@@ -35,7 +34,8 @@ export type RoutingImportProgress = {
 export async function importRoutingWorkbook(
   workbook: ParsedRoutingWorkbook,
   sha256: string,
-  onProgress: (progress: RoutingImportProgress) => void
+  onProgress: (progress: RoutingImportProgress) => void,
+  maxRowsPerChunk = 80
 ): Promise<{ importId: string; validation: unknown }> {
   const totalRows = workbook.sheet.rows.length;
   onProgress({ stage: "STARTING", sentRows: 0, totalRows, percent: 0 });
@@ -57,7 +57,7 @@ export async function importRoutingWorkbook(
   });
 
   let sentRows = 0;
-  for (const rows of splitRows(workbook.sheet.rows)) {
+  for (const rows of splitRows(workbook.sheet.rows, Math.max(1, Math.min(500, maxRowsPerChunk)))) {
     await apiJson<{ inserted: number }>("/api/routing-import/chunk", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

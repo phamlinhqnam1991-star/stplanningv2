@@ -9,6 +9,7 @@ const nav = [
   { href: "/routing", code: "ROUTE-05", label: "Job Routing" },
   { href: "/planning", code: "PLAN-10", label: "Planning" },
   { href: "/scheduling", code: "SCH-20", label: "Scheduling" },
+  { href: "/configuration", code: "CFG-90", label: "Configuration" },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -38,8 +39,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v008</strong>
-            <small>Full Job Routing + Phase 2/3</small>
+            <strong>Clean Rebuild v010</strong>
+            <small>Configuration-First Architecture</small>
           </div>
         </div>
       </aside>

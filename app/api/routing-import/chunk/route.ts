@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { withTransaction } from "@/lib/db";
 import type { PoolClient } from "pg";
-import { ROUTING_CORE_COLUMNS, ROUTING_SOURCE } from "@/lib/source-model";
+import { routingPrefixes, sourceCoreColumns, type SourceProfile } from "@/lib/config";
 import { asBooleanFlag, asInteger, asNumber, asText, isNonBlank, operationCodeFromSource, rawValue } from "@/lib/normalize";
 import type { RawRow } from "@/lib/types";
 
@@ -23,7 +23,7 @@ const rowSchema = z.object({
 
 const bodySchema = z.object({
   importId: z.string().uuid(),
-  rows: z.array(rowSchema).min(1).max(80),
+  rows: z.array(rowSchema).min(1).max(500),
 });
 
 function bulkValues(rows: unknown[][]) {
@@ -36,18 +36,18 @@ function bulkValues(rows: unknown[][]) {
   return { params, tuples };
 }
 
-function operationColumnMap(rows: { header_row_1: string | null; excel_column: string }[]) {
+function operationColumnMap(rows: { header_row_1: string | null; excel_column: string }[], operationSlots: number, prefixes: ReturnType<typeof routingPrefixes>) {
   const byHeader = new Map<string, string>();
   for (const row of rows) {
     const header = (row.header_row_1 ?? "").trim();
     if (header) byHeader.set(header, row.excel_column);
   }
   const slots = [] as Array<{ slot: number; op: string; complete: string; nonconf: string; seq: string }>;
-  for (let slot = 1; slot <= ROUTING_SOURCE.operationSlots; slot++) {
-    const op = byHeader.get(`Op.${slot}`);
-    const complete = byHeader.get(`OpC.${slot}`);
-    const nonconf = byHeader.get(`OpenNonConfOp.${slot}`);
-    const seq = byHeader.get(`OprSeq.${slot}`);
+  for (let slot = 1; slot <= operationSlots; slot++) {
+    const op = byHeader.get(`${prefixes.operation}${slot}`);
+    const complete = byHeader.get(`${prefixes.complete}${slot}`);
+    const nonconf = byHeader.get(`${prefixes.nonconformance}${slot}`);
+    const seq = byHeader.get(`${prefixes.sequence}${slot}`);
     if (!op || !complete || !nonconf || !seq) throw new Error(`Routing operation metadata is incomplete at slot ${slot}.`);
     slots.push({ slot, op, complete, nonconf, seq });
   }
@@ -79,13 +79,21 @@ export async function POST(request: Request) {
     }
 
     const result = await withTransaction(async (client) => {
-      const run = await client.query<{ status: string; route_row_count: number; sheet_name: string }>(
-        `SELECT status, route_row_count, sheet_name
+      const run = await client.query<{ status: string; route_row_count: number; sheet_name: string; config_snapshot: unknown }>(
+        `SELECT status, route_row_count, sheet_name, config_snapshot
          FROM route_import_runs WHERE id=$1 FOR UPDATE`,
         [body.importId]
       );
       if (!run.rowCount) throw new Error("Routing import run not found.");
       if (run.rows[0].status !== "IMPORTING") throw new Error("Routing import is no longer accepting chunks.");
+      const snapshot = run.rows[0].config_snapshot as { routing?: SourceProfile; settings?: Record<string, unknown> } | null;
+      const profile = snapshot?.routing;
+      if (!profile) throw new Error("Routing import has no configuration snapshot. Restart the import with the current version.");
+      const configuredMaxRows = Math.max(1, Math.min(500, Number(snapshot?.settings?.["import.maxRoutingChunkRows"] || 80)));
+      if (rows.length > configuredMaxRows) throw new Error(`Chunk exceeds configured routing import limit of ${configuredMaxRows} rows.`);
+      const core = sourceCoreColumns(profile);
+      const operationSlots = profile.operationSlots ?? 36;
+      const prefixes = routingPrefixes(profile);
       if (rows.some((row) => row.rowNo > run.rows[0].route_row_count)) {
         throw new Error("Routing chunk contains a row outside the worksheet used range.");
       }
@@ -104,7 +112,7 @@ export async function POST(request: Request) {
         rawBulk.params
       );
 
-      const dataRows = rows.filter((row) => row.rowNo > ROUTING_SOURCE.headerRows);
+      const dataRows = rows.filter((row) => row.rowNo > profile.headerRows);
       if (!dataRows.length) return { inserted: rows.length };
 
       const sourceNos = dataRows.map((row) => row.rowNo);
@@ -120,23 +128,23 @@ export async function POST(request: Request) {
          ORDER BY column_order`,
         [body.importId]
       );
-      const opSlots = operationColumnMap(columnResult.rows);
+      const opSlots = operationColumnMap(columnResult.rows, operationSlots, prefixes);
 
       const routeRows = dataRows.map((row) => {
         const operationCount = opSlots.reduce((count, slot) => count + (isNonBlank(rawValue(row, slot.op)) ? 1 : 0), 0);
         return [
           body.importId,
           row.rowNo,
-          asText(rawValue(row, ROUTING_CORE_COLUMNS.program)),
-          asText(rawValue(row, ROUTING_CORE_COLUMNS.epicorPart)),
-          asText(rawValue(row, ROUTING_CORE_COLUMNS.revisionNum)),
-          asText(rawValue(row, ROUTING_CORE_COLUMNS.jobNum)),
-          asNumber(rawValue(row, ROUTING_CORE_COLUMNS.prodQty)),
-          asText(rawValue(row, ROUTING_CORE_COLUMNS.lastLaborOp)),
-          asInteger(rawValue(row, ROUTING_CORE_COLUMNS.lastLaborOprSeq)),
-          asText(rawValue(row, ROUTING_CORE_COLUMNS.nextOperation)),
-          asInteger(rawValue(row, ROUTING_CORE_COLUMNS.lastCompleteOprSeq)),
-          asBooleanFlag(rawValue(row, ROUTING_CORE_COLUMNS.jobComplete)),
+          asText(rawValue(row, core.program || "D")),
+          asText(rawValue(row, core.epicorPart || "E")),
+          asText(rawValue(row, core.revisionNum || "X")),
+          asText(rawValue(row, core.jobNum || "J")),
+          asNumber(rawValue(row, core.prodQty || "L")),
+          asText(rawValue(row, core.lastLaborOp || "M")),
+          asInteger(rawValue(row, core.lastLaborOprSeq || "AB")),
+          asText(rawValue(row, core.nextOperation || "AC")),
+          asInteger(rawValue(row, core.lastCompleteOprSeq || "AZ")),
+          asBooleanFlag(rawValue(row, core.jobComplete || "AD")),
           operationCount,
         ];
       });

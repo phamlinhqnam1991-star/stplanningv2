@@ -37,3 +37,19 @@ export type ParsedRoutingWorkbook = {
   filename: string;
   sheet: ParsedSheet;
 };
+
+export type ParserSourceProfile = {
+  sourceKey: "PLANNING" | "SCHEDULING" | "ROUTING";
+  displayName: string;
+  sheetName: string | null;
+  headerRows: number;
+  baselineColumns: number;
+  operationSlots: number | null;
+  parserConfig: Record<string, unknown>;
+};
+
+export type ParserConfigBundle = {
+  planning: ParserSourceProfile;
+  scheduling: ParserSourceProfile;
+  routing: ParserSourceProfile;
+};

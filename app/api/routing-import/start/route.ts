@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { withTransaction } from "@/lib/db";
-import { ROUTING_SOURCE } from "@/lib/source-model";
+import { getConfigBootstrap, routingPrefixes } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,12 +21,12 @@ const bodySchema = z.object({
     name: z.string().min(1).max(200),
     totalRows: z.number().int().min(2),
     totalColumns: z.number().int().positive(),
-    headerRows: z.literal(1),
+    headerRows: z.number().int().positive(),
     columns: z.array(columnSchema).min(1).max(500),
   }),
 });
 
-function assertRoutingHeaders(columns: z.infer<typeof columnSchema>[]) {
+function assertRoutingHeaders(columns: z.infer<typeof columnSchema>[], operationSlots: number, prefixes: ReturnType<typeof routingPrefixes>) {
   const counts = new Map<string, number>();
   for (const column of columns) {
     const header = (column.headerRow1 ?? "").trim();
@@ -39,8 +39,8 @@ function assertRoutingHeaders(columns: z.infer<typeof columnSchema>[]) {
     }
   }
 
-  for (let slot = 1; slot <= ROUTING_SOURCE.operationSlots; slot++) {
-    for (const prefix of ["Op.", "OpC.", "OpenNonConfOp.", "OprSeq."]) {
+  for (let slot = 1; slot <= operationSlots; slot++) {
+    for (const prefix of [prefixes.operation, prefixes.complete, prefixes.nonconformance, prefixes.sequence]) {
       const header = `${prefix}${slot}`;
       if ((counts.get(header) ?? 0) !== 1) {
         throw new Error(`Routing source must contain exactly one "${header}" column.`);
@@ -53,22 +53,28 @@ export async function POST(request: Request) {
   try {
     const body = bodySchema.parse(await request.json());
     const { sheet } = body;
+    const bootstrap = await getConfigBootstrap();
+    const profile = bootstrap.sources.ROUTING;
+    if (!profile.enabled) throw new Error("Routing source profile is disabled in Configuration.");
+    const operationSlots = profile.operationSlots ?? 36;
 
-    if (sheet.totalColumns < ROUTING_SOURCE.baselineColumns) {
-      throw new Error(`Routing source requires at least ${ROUTING_SOURCE.baselineColumns} columns.`);
+    if (sheet.headerRows !== profile.headerRows) throw new Error(`Routing source header rows ${sheet.headerRows}; configuration expects ${profile.headerRows}.`);
+    if (sheet.totalColumns < profile.baselineColumns) {
+      throw new Error(`Routing source requires at least ${profile.baselineColumns} columns.`);
     }
     if (sheet.columns.length !== sheet.totalColumns) {
       throw new Error("Routing source column metadata does not match the worksheet used range.");
     }
-    assertRoutingHeaders(sheet.columns);
+    assertRoutingHeaders(sheet.columns, operationSlots, routingPrefixes(profile));
 
     const importId = await withTransaction(async (client) => {
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO route_import_runs
-          (source_filename, source_sha256, sheet_name, route_row_count, route_column_count)
-         VALUES ($1,$2,$3,$4,$5)
+          (source_filename, source_sha256, sheet_name, route_row_count, route_column_count, config_snapshot)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb)
          RETURNING id`,
-        [body.filename, body.sha256, sheet.name, sheet.totalRows, sheet.totalColumns]
+        [body.filename, body.sha256, sheet.name, sheet.totalRows, sheet.totalColumns,
+         JSON.stringify({ routing: profile, settings: bootstrap.settings })]
       );
       const id = inserted.rows[0].id;
 

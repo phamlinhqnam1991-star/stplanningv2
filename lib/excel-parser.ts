@@ -1,6 +1,6 @@
 "use client";
 
-import type { ParsedRoutingWorkbook, ParsedWorkbook } from "@/lib/types";
+import type { ParsedRoutingWorkbook, ParsedWorkbook, ParserConfigBundle } from "@/lib/types";
 
 export type ParseProgress = {
   stage: "READING" | "LOCATING" | "UNPACKING" | "PARSING" | "HASHING" | "COMPLETE";
@@ -36,7 +36,8 @@ function yieldToBrowser(): Promise<void> {
 async function runParserWorker(
   file: File,
   mode: "ST" | "ROUTING",
-  onProgress?: (progress: ParseProgress) => void
+  onProgress?: (progress: ParseProgress) => void,
+  config?: ParserConfigBundle
 ): Promise<WorkerDoneMessage> {
   onProgress?.({ stage: "READING", percent: 2 });
   await yieldToBrowser();
@@ -95,24 +96,26 @@ async function runParserWorker(
     worker.onerror = (event) => fail(event.message || "Excel parser worker crashed.");
     worker.onmessageerror = () => fail("The browser could not transfer parsed Excel data from the worker.");
 
-    worker.postMessage({ type: "PARSE", mode, filename: file.name, buffer }, [buffer]);
+    worker.postMessage({ type: "PARSE", mode, filename: file.name, buffer, config }, [buffer]);
   });
 }
 
 export async function parseWorkbook(
   file: File,
-  onProgress?: (progress: ParseProgress) => void
+  onProgress?: (progress: ParseProgress) => void,
+  config?: ParserConfigBundle
 ): Promise<{ workbook: ParsedWorkbook; sha256: string }> {
-  const result = await runParserWorker(file, "ST", onProgress);
+  const result = await runParserWorker(file, "ST", onProgress, config);
   if (!result.workbook) throw new Error("The ST workbook parser returned no workbook data.");
   return { workbook: result.workbook, sha256: result.sha256 };
 }
 
 export async function parseRoutingWorkbook(
   file: File,
-  onProgress?: (progress: ParseProgress) => void
+  onProgress?: (progress: ParseProgress) => void,
+  config?: ParserConfigBundle
 ): Promise<{ workbook: ParsedRoutingWorkbook; sha256: string }> {
-  const result = await runParserWorker(file, "ROUTING", onProgress);
+  const result = await runParserWorker(file, "ROUTING", onProgress, config);
   if (!result.routingWorkbook) throw new Error("The routing workbook parser returned no route data.");
   return { workbook: result.routingWorkbook, sha256: result.sha256 };
 }

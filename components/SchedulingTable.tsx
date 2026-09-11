@@ -26,6 +26,12 @@ type ScheduleRow = {
 
 type Summary = { total: number; totalPcs: number; totalSurface: number; totalJobs: number; activeResources: number };
 type Meta = { minDate: string | null; maxDate: string | null; statuses: string[]; resources: string[] };
+type BootstrapConfig = {
+  resources: Array<{ code: string; label: string; sortOrder?: number; data?: Record<string, unknown> }>;
+  statuses: Array<{ code: string; label: string; sortOrder?: number; data?: Record<string, unknown> }>;
+  settings?: Record<string, unknown>;
+  views?: Array<{ viewKey: string; isDefault: boolean; config: Record<string, unknown> }>;
+};
 type SortKey = "row" | "date" | "slot" | "batch" | "recipe" | "pcs" | "surface" | "start" | "duration" | "status";
 type Direction = "asc" | "desc";
 type ViewMode = "table" | "timeline";
@@ -45,7 +51,7 @@ type ViewState = {
 };
 type SavedView = { name: string; state: ViewState };
 
-const RESOURCE_LABELS: Record<string, string> = {
+const FALLBACK_RESOURCE_LABELS: Record<string, string> = {
   SPX_CLEAN: "SPX Clean",
   MANUAL_DBL: "Manual DBL",
   AUTO_DBL: "Auto DBL",
@@ -96,11 +102,20 @@ function timeToMinute(time: string | null): number | null {
 function statusClass(status: string | null) {
   return `status-${(status || "none").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
 }
+type VisualStyle = { backgroundColor?: string; color?: string; borderColor?: string };
+function visualStyle(data: Record<string, unknown> | undefined): VisualStyle {
+  const valid = (value: unknown) => typeof value === "string" && /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/.test(value) ? value : undefined;
+  return { backgroundColor: valid(data?.background), color: valid(data?.text), borderColor: valid(data?.border) };
+}
 
 export function SchedulingTable() {
   const [rows, setRows] = useState<ScheduleRow[]>([]);
   const [summary, setSummary] = useState<Summary>({ total: 0, totalPcs: 0, totalSurface: 0, totalJobs: 0, activeResources: 0 });
   const [meta, setMeta] = useState<Meta>({ minDate: null, maxDate: null, statuses: [], resources: [] });
+  const [resourceLabels, setResourceLabels] = useState<Record<string, string>>(FALLBACK_RESOURCE_LABELS);
+  const [resourceOrder, setResourceOrder] = useState<string[]>(Object.keys(FALLBACK_RESOURCE_LABELS));
+  const [statusLabels, setStatusLabels] = useState<Record<string, string>>({});
+  const [statusStyles, setStatusStyles] = useState<Record<string, VisualStyle>>({});
   const [offset, setOffset] = useState(0);
   const [search, setSearch] = useState("");
   const [queryText, setQueryText] = useState("");
@@ -111,6 +126,7 @@ export function SchedulingTable() {
   const [sort, setSort] = useState<SortKey>("date");
   const [direction, setDirection] = useState<Direction>("asc");
   const [pageSize, setPageSize] = useState(100);
+  const [maxPageSize, setMaxPageSize] = useState(500);
   const [visibleColumns, setVisibleColumns] = useState<ColumnKey[]>(DEFAULT_COLUMNS);
   const [mode, setMode] = useState<ViewMode>("table");
   const [savedViews, setSavedViews] = useState<SavedView[]>([]);
@@ -119,18 +135,48 @@ export function SchedulingTable() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]") as SavedView[];
-      setSavedViews(Array.isArray(saved) ? saved : []);
-      const current = JSON.parse(localStorage.getItem(CURRENT_KEY) || "null") as ViewState | null;
+    let cancelled = false;
+    void (async () => {
+      let current: ViewState | null = null;
+      try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]") as SavedView[];
+        setSavedViews(Array.isArray(saved) ? saved : []);
+        current = JSON.parse(localStorage.getItem(CURRENT_KEY) || "null") as ViewState | null;
+      } catch { /* ignore corrupt browser state */ }
+
+      let cfg: BootstrapConfig | null = null;
+      try { cfg = await apiJson<BootstrapConfig>("/api/config/bootstrap", { cache: "no-store" }); } catch { /* fallback below */ }
+      if (cancelled) return;
+
+      if (cfg) {
+        setResourceLabels({ ...FALLBACK_RESOURCE_LABELS, ...Object.fromEntries((cfg.resources || []).map((x) => [x.code, x.label])) });
+        setResourceOrder((cfg.resources || []).length ? cfg.resources.map((x) => x.code) : Object.keys(FALLBACK_RESOURCE_LABELS));
+        setStatusLabels(Object.fromEntries((cfg.statuses || []).map((x) => [x.code.toUpperCase(), x.label])));
+        setStatusStyles(Object.fromEntries((cfg.statuses || []).map((x) => [x.code.toUpperCase(), visualStyle(x.data)])));
+      }
+      const max = Math.max(20, Math.min(1000, Number(cfg?.settings?.["ui.maxPageSize"] || 500)));
+      const configuredDefault = Math.max(20, Math.min(max, Number(cfg?.settings?.["ui.defaultPageSize"] || 100)));
+      setMaxPageSize(max);
+
       if (current) {
         setSearch(current.search || ""); setQueryText(current.search || "");
         setStatus(current.status || ""); setResource(current.resource || ""); setDateFrom(current.dateFrom || ""); setDateTo(current.dateTo || "");
         setSort(current.sort || "date"); setDirection(current.direction || "asc"); setVisibleColumns(current.visibleColumns?.length ? current.visibleColumns : DEFAULT_COLUMNS);
-        setPageSize(current.pageSize || 100); setMode(current.mode || "table");
+        setPageSize(Math.min(max, Math.max(20, current.pageSize || configuredDefault))); setMode(current.mode || "table");
+      } else {
+        const view = cfg?.views?.find((v) => v.viewKey === "SCHEDULING" && v.isDefault)?.config || {};
+        const viewColumns = Array.isArray(view.visibleColumns) ? view.visibleColumns.filter((x): x is ColumnKey => ALL_COLUMNS.some((c) => c.key === x)) : [];
+        const viewSort = typeof view.sort === "string" && ALL_COLUMNS.some((c) => c.sort === view.sort) ? view.sort as SortKey : "date";
+        const viewDirection: Direction = view.direction === "desc" ? "desc" : "asc";
+        const viewMode: ViewMode = view.mode === "timeline" ? "timeline" : "table";
+        const viewPageSize = Number(view.pageSize || configuredDefault);
+        setSort(viewSort); setDirection(viewDirection); setMode(viewMode);
+        setVisibleColumns(viewColumns.length ? viewColumns : DEFAULT_COLUMNS);
+        setPageSize(Math.min(max, Math.max(20, Number.isFinite(viewPageSize) ? viewPageSize : configuredDefault)));
       }
-    } catch { /* ignore corrupt browser state */ }
-    setReady(true);
+      setReady(true);
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -143,7 +189,11 @@ export function SchedulingTable() {
     localStorage.setItem(CURRENT_KEY, JSON.stringify(state));
   }, [ready, queryText, status, resource, dateFrom, dateTo, sort, direction, visibleColumns, pageSize, mode]);
 
-  const effectiveLimit = mode === "timeline" ? 500 : pageSize;
+  const pageSizeOptions = useMemo(() => {
+    const values = [25, 50, 100, 200, 500, pageSize].filter((n) => n <= maxPageSize && n >= 20);
+    return [...new Set(values)].sort((a, b) => a - b);
+  }, [maxPageSize, pageSize]);
+  const effectiveLimit = mode === "timeline" ? Math.min(500, maxPageSize) : pageSize;
   const load = useCallback(async () => {
     if (!ready) return;
     setLoading(true); setError("");
@@ -193,7 +243,7 @@ export function SchedulingTable() {
       case "row": return <span className="mono">{row.source_row_no}</span>;
       case "date": return <>{row.schedule_date || "—"}<small className="subcell">{row.day_label}</small></>;
       case "slot": return row.slot_no ?? "—";
-      case "resources": return <div className="resource-list">{row.resources?.length ? row.resources.map((x, i) => <span className="resource-chip" key={`${x.resourceCode}-${i}`}>{RESOURCE_LABELS[x.resourceCode] || x.resourceCode}<b>{x.batchRef}</b></span>) : <span className="muted">Unassigned</span>}</div>;
+      case "resources": return <div className="resource-list">{row.resources?.length ? row.resources.map((x, i) => <span className="resource-chip" key={`${x.resourceCode}-${i}`}>{resourceLabels[x.resourceCode] || x.resourceCode}<b>{x.batchRef}</b></span>) : <span className="muted">Unassigned</span>}</div>;
       case "batch": return <span className="mono"><strong>{row.batch_ref || "—"}</strong></span>;
       case "recipe": return <><span className="mono">{row.recipe_no || "—"}</span><small className="subcell">{row.recipe_description}</small></>;
       case "jobs": return fmt(row.job_count);
@@ -202,7 +252,7 @@ export function SchedulingTable() {
       case "start": return <span className="mono">{timeLabel(row.start_time)}</span>;
       case "end": return <span className="mono">{timeLabel(row.end_time)}</span>;
       case "duration": return row.duration_minutes != null ? `${Math.round(Number(row.duration_minutes))} min` : "—";
-      case "status": return <span className={`badge ${statusClass(row.status)}`}>{row.status || "—"}</span>;
+      case "status": { const code = (row.status || "").toUpperCase(); return <span className={`badge ${statusClass(row.status)}`} style={statusStyles[code]}>{statusLabels[code] || row.status || "—"}</span>; }
       case "comments": return <span title={row.comments || ""}>{row.comments || "—"}</span>;
     }
   }
@@ -233,14 +283,14 @@ export function SchedulingTable() {
       <div className="filter-ribbon scheduling-filters">
         <label><span>Date From</span><input type="date" min={meta.minDate || undefined} max={meta.maxDate || undefined} value={dateFrom} onChange={(e) => { setDateFrom(e.target.value); setOffset(0); }} /></label>
         <label><span>Date To</span><input type="date" min={meta.minDate || undefined} max={meta.maxDate || undefined} value={dateTo} onChange={(e) => { setDateTo(e.target.value); setOffset(0); }} /></label>
-        <label><span>Resource</span><select value={resource} onChange={(e) => { setResource(e.target.value); setOffset(0); }}><option value="">All Resources</option>{meta.resources.map((x) => <option key={x} value={x}>{RESOURCE_LABELS[x] || x}</option>)}</select></label>
-        <label><span>Status</span><select value={status} onChange={(e) => { setStatus(e.target.value); setOffset(0); }}><option value="">All Statuses</option>{meta.statuses.map((x) => <option key={x}>{x}</option>)}</select></label>
-        {mode === "table" ? <label className="small-control"><span>Rows / Page</span><select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setOffset(0); }}><option>50</option><option>100</option><option>200</option><option>500</option></select></label> : <div className="timeline-hint"><strong>Timeline</strong><span>Auto-scaled from filtered Start / End values</span></div>}
+        <label><span>Resource</span><select value={resource} onChange={(e) => { setResource(e.target.value); setOffset(0); }}><option value="">All Resources</option>{meta.resources.map((x) => <option key={x} value={x}>{resourceLabels[x] || x}</option>)}</select></label>
+        <label><span>Status</span><select value={status} onChange={(e) => { setStatus(e.target.value); setOffset(0); }}><option value="">All Statuses</option>{meta.statuses.map((x) => <option key={x} value={x}>{statusLabels[x.toUpperCase()] || x}</option>)}</select></label>
+        {mode === "table" ? <label className="small-control"><span>Rows / Page</span><select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setOffset(0); }}>{pageSizeOptions.map((n) => <option key={n} value={n}>{n}</option>)}</select></label> : <div className="timeline-hint"><strong>Timeline</strong><span>Auto-scaled from filtered Start / End values</span></div>}
         <div className="record-count"><strong>{summary.total.toLocaleString()}</strong><span>matching blocks</span></div>
       </div>
 
       {error ? <div className="alert error">{error}</div> : null}
-      {mode === "table" ? <ScheduleTable rows={rows} visible={visible} sort={sort} direction={direction} loading={loading} onSort={toggleSort} renderCell={renderCell} /> : <ScheduleTimeline rows={rows} loading={loading} resourceFilter={resource} />}
+      {mode === "table" ? <ScheduleTable rows={rows} visible={visible} sort={sort} direction={direction} loading={loading} onSort={toggleSort} renderCell={renderCell} /> : <ScheduleTimeline rows={rows} loading={loading} resourceFilter={resource} resourceLabels={resourceLabels} resourceOrder={resourceOrder} statusStyles={statusStyles} />}
 
       <div className="pager">
         <span className="pager-context">{mode === "timeline" ? "Timeline shows up to 500 filtered schedule blocks." : <>Sort: <strong>{ALL_COLUMNS.find((c) => c.sort === sort)?.label || "Date"}</strong> {direction.toUpperCase()}</>}</span>
@@ -266,7 +316,7 @@ function ScheduleTable({ rows, visible, sort, direction, loading, onSort, render
 
 type TimelineEntry = { row: ScheduleRow; resourceCode: string; start: number | null; end: number | null };
 
-function ScheduleTimeline({ rows, loading, resourceFilter }: { rows: ScheduleRow[]; loading: boolean; resourceFilter: string }) {
+function ScheduleTimeline({ rows, loading, resourceFilter, resourceLabels, resourceOrder, statusStyles }: { rows: ScheduleRow[]; loading: boolean; resourceFilter: string; resourceLabels: Record<string, string>; resourceOrder: string[]; statusStyles: Record<string, VisualStyle> }) {
   const entries = useMemo<TimelineEntry[]>(() => {
     const out: TimelineEntry[] = [];
     for (const row of rows) {
@@ -298,7 +348,6 @@ function ScheduleTimeline({ rows, loading, resourceFilter }: { rows: ScheduleRow
     const list = groups.get(entry.resourceCode) || [];
     list.push(entry); groups.set(entry.resourceCode, list);
   }
-  const resourceOrder = Object.keys(RESOURCE_LABELS);
   const groupKeys = [...groups.keys()].sort((a, b) => {
     const ai = resourceOrder.indexOf(a), bi = resourceOrder.indexOf(b);
     return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) || a.localeCompare(b);
@@ -319,7 +368,7 @@ function ScheduleTimeline({ rows, loading, resourceFilter }: { rows: ScheduleRow
         const untimed = laneEntries.filter((e) => e.start == null);
         const height = Math.max(58, timedEntries.length * 36 + (untimed.length ? 34 : 0) + 12);
         return <div className="timeline-lane" key={key} style={{ minHeight: height }}>
-          <div className="timeline-resource-label"><strong>{RESOURCE_LABELS[key] || key}</strong><span>{laneEntries.length} blocks</span></div>
+          <div className="timeline-resource-label"><strong>{resourceLabels[key] || key}</strong><span>{laneEntries.length} blocks</span></div>
           <div className="timeline-track" style={{ minHeight: height }}>
             {ticks.map((m) => <i className="timeline-gridline" key={m} style={{ left: `${((m - minMinute) / span) * 100}%` }} />)}
             {timedEntries.map((entry, index) => {
@@ -327,7 +376,7 @@ function ScheduleTimeline({ rows, loading, resourceFilter }: { rows: ScheduleRow
               const end = entry.end ?? (start + Math.max(30, Number(entry.row.duration_minutes || 60)));
               const left = Math.max(0, ((start - minMinute) / span) * 100);
               const width = Math.max(1.4, ((Math.max(start + 15, end) - start) / span) * 100);
-              return <div className={`timeline-card ${statusClass(entry.row.status)}`} key={`${entry.row.id}-${key}-${index}`} style={{ left: `${left}%`, width: `${Math.min(100 - left, width)}%`, top: 7 + index * 36 }} title={`${entry.row.batch_ref || "No batch"} | ${timeLabel(entry.row.start_time)}–${timeLabel(entry.row.end_time)} | ${entry.row.recipe_no || "No recipe"}`}>
+              return <div className={`timeline-card ${statusClass(entry.row.status)}`} key={`${entry.row.id}-${key}-${index}`} style={{ left: `${left}%`, width: `${Math.min(100 - left, width)}%`, top: 7 + index * 36, ...statusStyles[(entry.row.status || "").toUpperCase()] }} title={`${entry.row.batch_ref || "No batch"} | ${timeLabel(entry.row.start_time)}–${timeLabel(entry.row.end_time)} | ${entry.row.recipe_no || "No recipe"}`}>
                 <strong>{entry.row.batch_ref || `Row ${entry.row.source_row_no}`}</strong><span>{timeLabel(entry.row.start_time)}–{timeLabel(entry.row.end_time)}</span><em>{entry.row.recipe_no || ""}</em>
               </div>;
             })}

@@ -1,5 +1,5 @@
 import { ROUTING_SOURCE, SOURCE_SHEETS, excelColumnLetter } from "@/lib/source-model";
-import type { ParsedRoutingWorkbook, ParsedSheet, ParsedWorkbook, RawCell, RawRow, SourceColumn } from "@/lib/types";
+import type { ParsedRoutingWorkbook, ParsedSheet, ParsedWorkbook, RawCell, RawRow, SourceColumn, ParserConfigBundle, ParserSourceProfile } from "@/lib/types";
 import type { ParseProgress } from "@/lib/excel-parser";
 
 type ParseRequest = {
@@ -7,6 +7,7 @@ type ParseRequest = {
   mode: "ST" | "ROUTING";
   filename: string;
   buffer: ArrayBuffer;
+  config?: ParserConfigBundle;
 };
 
 type ProgressMessage = {
@@ -258,49 +259,65 @@ function normalizedHeader(cell: RawCell | null): string {
   return String(cell.v).replace(/\s+/g, " ").trim().toUpperCase();
 }
 
-const criticalHeaders: Record<ParseKey, Record<string, string>> = {
-  planning: {
-    A: "PROGRAM",
-    C: "EPICORPART",
-    F: "JOBNUM",
-    H: "NEXTOPERATION",
-    M: "CMSA",
-    AV: "VARNISH",
-  },
-  scheduling: {
-    A: "DATE",
-    D: "SPX CLEAN",
-    Q: "SP#/FB#/PB#",
-    R: "RECIPE#",
-    AJ: "STATUS",
-  },
-  routing: {
-    D: "PROGRAM",
-    E: "EPICORPART",
-    J: "JOBNUM",
-    AC: "NEXTOPERATION",
-    CI: "OP.1",
-    CW: "OPRSEQ.1",
-    IN: "OPRSEQ.36",
-  },
-};
+function fallbackProfile(key: ParseKey): ParserSourceProfile {
+  if (key === "routing") {
+    return {
+      sourceKey: "ROUTING",
+      displayName: ROUTING_SOURCE.displayName,
+      sheetName: "Sheet1",
+      headerRows: ROUTING_SOURCE.headerRows,
+      baselineColumns: ROUTING_SOURCE.baselineColumns,
+      operationSlots: ROUTING_SOURCE.operationSlots,
+      parserConfig: {
+        criticalHeaders: { D: "PROGRAM", E: "EPICORPART", J: "JOBNUM", AC: "NEXTOPERATION", CI: "OP.1", CW: "OPRSEQ.1", IN: "OPRSEQ.36" },
+        preferredSheetName: "Sheet1",
+        operationPrefixes: { operation: "Op.", complete: "OpC.", nonconformance: "OpenNonConfOp.", sequence: "OprSeq." },
+      },
+    };
+  }
+  const source = SOURCE_SHEETS[key];
+  const criticalHeaders = key === "planning"
+    ? { A: "PROGRAM", C: "EPICORPART", F: "JOBNUM", H: "NEXTOPERATION", M: "CMSA", AV: "VARNISH" }
+    : { A: "DATE", D: "SPX CLEAN", Q: "SP#/FB#/PB#", R: "RECIPE#", AJ: "STATUS" };
+  return {
+    sourceKey: key === "planning" ? "PLANNING" : "SCHEDULING",
+    displayName: source.name,
+    sheetName: source.name,
+    headerRows: source.headerRows,
+    baselineColumns: source.baselineColumns,
+    operationSlots: null,
+    parserConfig: { criticalHeaders },
+  };
+}
+
+function requestProfile(request: ParseRequest, key: ParseKey): ParserSourceProfile {
+  if (key === "planning") return request.config?.planning ?? fallbackProfile(key);
+  if (key === "scheduling") return request.config?.scheduling ?? fallbackProfile(key);
+  return request.config?.routing ?? fallbackProfile(key);
+}
+
+function criticalHeadersFor(profile: ParserSourceProfile): Record<string, string> {
+  const value = profile.parserConfig?.criticalHeaders;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, string>;
+}
+
+function operationPrefixes(profile: ParserSourceProfile) {
+  const raw = profile.parserConfig?.operationPrefixes;
+  const value = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  return {
+    operation: String(value.operation ?? "Op."),
+    complete: String(value.complete ?? "OpC."),
+    nonconformance: String(value.nonconformance ?? "OpenNonConfOp."),
+    sequence: String(value.sequence ?? "OprSeq."),
+  };
+}
 
 function rowCell(rows: RawRow[], rowNo: number, column: string): RawCell | null {
   return rows[rowNo - 1]?.cells[column] ?? null;
 }
 
-function configForKey(key: ParseKey) {
-  if (key === "routing") {
-    return {
-      name: ROUTING_SOURCE.displayName,
-      headerRows: ROUTING_SOURCE.headerRows,
-      baselineColumns: ROUTING_SOURCE.baselineColumns,
-    };
-  }
-  return SOURCE_SHEETS[key];
-}
-
-function validateRoutingOperationHeaders(columns: SourceColumn[]) {
+function validateRoutingOperationHeaders(columns: SourceColumn[], profile: ParserSourceProfile) {
   const headerToColumns = new Map<string, string[]>();
   for (const column of columns) {
     const header = (column.headerRow1 ?? "").trim();
@@ -310,8 +327,10 @@ function validateRoutingOperationHeaders(columns: SourceColumn[]) {
     headerToColumns.set(header, current);
   }
 
-  for (let slot = 1; slot <= ROUTING_SOURCE.operationSlots; slot++) {
-    for (const prefix of ["Op.", "OpC.", "OpenNonConfOp.", "OprSeq."]) {
+  const prefixes = operationPrefixes(profile);
+  const slots = profile.operationSlots ?? ROUTING_SOURCE.operationSlots;
+  for (let slot = 1; slot <= slots; slot++) {
+    for (const prefix of [prefixes.operation, prefixes.complete, prefixes.nonconformance, prefixes.sequence]) {
       const header = `${prefix}${slot}`;
       const found = headerToColumns.get(header) ?? [];
       if (found.length !== 1) {
@@ -327,9 +346,10 @@ function parseWorksheetXml(
   key: ParseKey,
   progressStart: number,
   progressEnd: number,
+  profile: ParserSourceProfile,
   actualSheetName?: string
 ): ParsedSheet {
-  const config = configForKey(key);
+  const config = { name: profile.displayName, headerRows: profile.headerRows, baselineColumns: profile.baselineColumns };
   const { totalRows, totalColumns } = parseDimension(xml);
 
   if (totalColumns < config.baselineColumns) {
@@ -375,7 +395,7 @@ function parseWorksheetXml(
     }
   }
 
-  for (const [letter, expected] of Object.entries(criticalHeaders[key])) {
+  for (const [letter, expected] of Object.entries(criticalHeadersFor(profile))) {
     const actual = normalizedHeader(rowCell(rows, config.headerRows, letter));
     if (actual !== expected) {
       throw new Error(`${actualSheetName ?? config.name}: expected ${letter}${config.headerRows} to be "${expected}", found "${actual || "<blank>"}".`);
@@ -398,7 +418,7 @@ function parseWorksheetXml(
     });
   }
 
-  if (key === "routing") validateRoutingOperationHeaders(columns);
+  if (key === "routing") validateRoutingOperationHeaders(columns, profile);
 
   postProgress({ stage: "PARSING", sheet: actualSheetName ?? config.name, percent: progressEnd });
   return {
@@ -443,20 +463,24 @@ async function workbookParts(buffer: ArrayBuffer) {
 
 async function parseStWorkbook(request: ParseRequest): Promise<DoneMessage> {
   const { entries, paths, sharedStrings } = await workbookParts(request.buffer);
-  const planningPath = paths.get(SOURCE_SHEETS.planning.name);
-  const schedulingPath = paths.get(SOURCE_SHEETS.scheduling.name);
-  if (!planningPath) throw new Error(`Required worksheet not found: ${SOURCE_SHEETS.planning.name}`);
-  if (!schedulingPath) throw new Error(`Required worksheet not found: ${SOURCE_SHEETS.scheduling.name}`);
+  const planningProfile = requestProfile(request, "planning");
+  const schedulingProfile = requestProfile(request, "scheduling");
+  const planningName = planningProfile.sheetName || planningProfile.displayName;
+  const schedulingName = schedulingProfile.sheetName || schedulingProfile.displayName;
+  const planningPath = paths.get(planningName);
+  const schedulingPath = paths.get(schedulingName);
+  if (!planningPath) throw new Error(`Required worksheet not found: ${planningName}`);
+  if (!schedulingPath) throw new Error(`Required worksheet not found: ${schedulingName}`);
 
-  postProgress({ stage: "UNPACKING", percent: 17, sheet: SOURCE_SHEETS.planning.name });
+  postProgress({ stage: "UNPACKING", percent: 17, sheet: planningName });
   const planningXml = await readZipText(request.buffer, entries, planningPath);
-  postProgress({ stage: "PARSING", percent: 20, sheet: SOURCE_SHEETS.planning.name });
-  const planning = parseWorksheetXml(planningXml, sharedStrings, "planning", 20, 76);
+  postProgress({ stage: "PARSING", percent: 20, sheet: planningName });
+  const planning = parseWorksheetXml(planningXml, sharedStrings, "planning", 20, 76, planningProfile, planningName);
 
-  postProgress({ stage: "UNPACKING", percent: 78, sheet: SOURCE_SHEETS.scheduling.name });
+  postProgress({ stage: "UNPACKING", percent: 78, sheet: schedulingName });
   const schedulingXml = await readZipText(request.buffer, entries, schedulingPath);
-  postProgress({ stage: "PARSING", percent: 80, sheet: SOURCE_SHEETS.scheduling.name });
-  const scheduling = parseWorksheetXml(schedulingXml, sharedStrings, "scheduling", 80, 96);
+  postProgress({ stage: "PARSING", percent: 80, sheet: schedulingName });
+  const scheduling = parseWorksheetXml(schedulingXml, sharedStrings, "scheduling", 80, 96, schedulingProfile, schedulingName);
 
   postProgress({ stage: "HASHING", percent: 98 });
   const sha256 = await sha256Hex(request.buffer);
@@ -472,14 +496,16 @@ async function parseRoutingWorkbook(request: ParseRequest): Promise<DoneMessage>
   const { entries, refs, paths, sharedStrings } = await workbookParts(request.buffer);
   if (!refs.length) throw new Error("The routing workbook has no worksheets.");
 
-  const preferred = refs.find((r) => r.name === "Sheet1") ?? refs[0];
+  const routingProfile = requestProfile(request, "routing");
+  const preferredName = String(routingProfile.parserConfig?.preferredSheetName ?? routingProfile.sheetName ?? "");
+  const preferred = refs.find((r) => r.name === preferredName) ?? refs[0];
   const routePath = paths.get(preferred.name);
   if (!routePath) throw new Error(`Unable to locate routing worksheet: ${preferred.name}`);
 
   postProgress({ stage: "UNPACKING", percent: 18, sheet: preferred.name });
   const routeXml = await readZipText(request.buffer, entries, routePath);
   postProgress({ stage: "PARSING", percent: 22, sheet: preferred.name });
-  const routing = parseWorksheetXml(routeXml, sharedStrings, "routing", 22, 96, preferred.name);
+  const routing = parseWorksheetXml(routeXml, sharedStrings, "routing", 22, 96, routingProfile, preferred.name);
 
   postProgress({ stage: "HASHING", percent: 98 });
   const sha256 = await sha256Hex(request.buffer);
