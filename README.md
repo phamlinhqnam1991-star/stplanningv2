@@ -1,3 +1,7 @@
+# Current baseline: v013 — Recipe + Process Time Model
+
+See `README_v013.md` for upgrade and configuration details.
+
 # v009 Route Analysis
 
 See `README_v009.md` and `docs/ROUTING_ANALYSIS.md`. No SQL migration is required from v008.

@@ -1,24 +1,31 @@
--- ST Planning Clean Rebuild v011 — Config-Driven Planning Model
+-- ST Planning Clean Rebuild v013 — Recipe + Process Time Model
 -- Aiven Query Editor: maximum 8 statements per execution.
 -- This file is an instruction index only. Run each numbered SQL file separately.
 --
 -- Fresh database — run in order:
--- 01_core_raw.sql             : 7 statements
--- 02_planning.sql             : 8 statements
--- 03_scheduling.sql           : 7 statements
--- 04_views.sql                : 3 statements
--- 05_routing_core.sql         : 8 statements
--- 06_routing_operations.sql   : 7 statements
--- 07_config_core.sql          : 8 statements
--- 08_config_defaults.sql      : 7 statements
--- 09_config_links_seed.sql    : 4 statements
--- 10_planning_model_config.sql: 7 statements
+-- 01_core_raw.sql                     : 7 statements
+-- 02_planning.sql                     : 8 statements
+-- 03_scheduling.sql                   : 7 statements
+-- 04_views.sql                        : 3 statements
+-- 05_routing_core.sql                 : 8 statements
+-- 06_routing_operations.sql           : 7 statements
+-- 07_config_core.sql                  : 8 statements
+-- 08_config_defaults.sql              : 7 statements
+-- 09_config_links_seed.sql            : 4 statements
+-- 10_planning_model_config.sql        : 7 statements
+-- 11_seed_hierarchy_masters.sql       : <=8 statements
+-- 12_seed_hierarchy_links.sql         : <=8 statements
+-- 13_seed_operation_masters.sql       : <=8 statements
+-- 14_seed_operation_mappings.sql      : <=8 statements
+-- 15_recipe_model_definitions.sql     : 4 statements
+-- 16_recipe_master_seed.sql           : 1 statement
+-- 17_recipe_process_source_fields.sql : 2 statements
+-- 18_recipe_rules_seed.sql            : 1 statement
+-- 19_process_time_profiles.sql        : 1 statement
+-- 20_process_time_rules_seed.sql      : 1 statement
 --
--- Upgrade from v010:
--- run only 10_planning_model_config.sql
+-- Upgrade from v012:
+-- run only 15 -> 16 -> 17 -> 18 -> 19 -> 20
 --
--- Upgrade from v009:
--- run 07 -> 08 -> 09 -> 10
---
--- Upgrade from v007 (before routing):
--- run 05 -> 06 -> 07 -> 08 -> 09 -> 10
+-- Recipe/process verification:
+-- verify_v013_recipe.sql               : 6 queries

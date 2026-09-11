@@ -3,6 +3,7 @@ import { query } from "@/lib/db";
 import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
 import { getConfigBootstrap, numberSetting, routeConfigOptionsFromSettings, sourceDisplayColumns } from "@/lib/config";
 import { classifyOperationRoute, getPlanningModel } from "@/lib/planning-model";
+import { getRecipeModel, resolveProcessTime, resolveRecipe } from "@/lib/recipe-model";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,6 +30,7 @@ export async function GET(request: Request) {
     const bootstrap = await getConfigBootstrap();
     const routeOptions = routeConfigOptionsFromSettings(bootstrap.settings);
     const planningModel = await getPlanningModel();
+    const recipeModel = await getRecipeModel();
     const planningProfile = bootstrap.sources.PLANNING;
     const planningSheetName = planningProfile.sheetName || planningProfile.displayName;
     const display = sourceDisplayColumns(planningProfile);
@@ -131,6 +133,7 @@ export async function GET(request: Request) {
               ${priorityTypeExpr} AS priority_type,
               ${catTransitExpr} AS cat_transit,
               ${impactSaleExpr} AS impact_sale_value,
+              rr.row_data AS raw_row_data,
               COALESCE(op.operation_count,0)::int AS operation_count,
               COALESCE(op.operations,'[]'::jsonb) AS operations,
               route.route_id, route.route_next_operation, route.route_operation_count,
@@ -192,15 +195,21 @@ export async function GET(request: Request) {
         sourceOperation: planningClassification.steps.find((step) => step.mainOperationCode === main.code)?.sourceOperation || "",
       })) || [];
       const nextMain = planningClassification?.nextMainOperation || null;
+      const nextPlanning = planningClassification?.nextPlanningOperation || null;
+      const recipeSuggestion = resolveRecipe(nextPlanning?.code || null, row.raw_row_data, recipeModel);
+      const processTimeSuggestion = resolveProcessTime(nextPlanning?.code || null, row.raw_row_data, recipeSuggestion, recipeModel);
+      const { raw_row_data: _rawRowData, ...publicRow } = row;
       return {
-        ...row,
+        ...publicRow,
         routeAnalysis,
         planningClassification,
         nextMainOperation: nextMain ? { code: nextMain.code, label: nextMain.label } : null,
-        nextPlanningOperation: planningClassification?.nextPlanningOperation || null,
+        nextPlanningOperation: nextPlanning,
         remainingMainOperations,
         remainingPlanningOperations: planningClassification?.remainingPlanningOperations || [],
         unmappedStOperations: planningClassification?.unmappedOperations || [],
+        recipeSuggestion,
+        processTimeSuggestion,
       };
     });
 

@@ -58,13 +58,24 @@ type PlanningRow = {
   nextPlanningOperation: MainPlanningDefinition | null;
   remainingPlanningOperations: MainPlanningDefinition[];
   unmappedStOperations: string[];
+  recipeSuggestion: {
+    status: "MATCHED" | "SOURCE_ONLY" | "AMBIGUOUS" | "NO_VALUE" | "NO_RULE";
+    ruleCode: string | null; selector: string | null; recipeNo: string | null; recipeName: string | null;
+    recipeGroup: string | null; sourceField: string | null; sourceColumn: string | null; sourceValue: string | null;
+    confidence: string | null; needsReview: boolean; candidates: Array<{ code: string; label: string }>;
+  };
+  processTimeSuggestion: {
+    status: "RESOLVED" | "REVIEW_REQUIRED" | "NO_RULE" | "NO_VALUE";
+    ruleCode: string | null; mode: string | null; minutes: number | null; unit: string | null;
+    sourceField: string | null; sourceValue: string | null; profile: string | null; needsReview: boolean;
+  };
 };
 
 type PlanningSummary = { total: number; totalQty: number; totalSurface: number; programs: number; priorityRows: number };
 type Meta = { programs: string[]; nextOperations: string[]; operations: string[]; priorities: string[] };
 type SortKey = "row" | "program" | "part" | "revision" | "job" | "nextOperation" | "prodQty" | "goodWip" | "surface" | "priority";
 type Direction = "asc" | "desc";
-type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "routePos" | "nextSt" | "nextMain" | "nextPlan" | "planningArea" | "planner" | "unmapped" | "remainingSt" | "remainingMain" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
+type ColumnKey = "row" | "program" | "partCluster" | "part" | "revision" | "description" | "job" | "nextOp" | "lastOp" | "routePos" | "nextSt" | "nextMain" | "nextPlan" | "recipe" | "processTime" | "planningArea" | "planner" | "unmapped" | "remainingSt" | "remainingMain" | "prodQty" | "goodWip" | "surface" | "area" | "sequence" | "priority" | "catTransit" | "impactSale" | "operations";
 
 type ViewState = {
   search: string;
@@ -98,6 +109,8 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "nextSt", label: "Next ST Operation" },
   { key: "nextMain", label: "Next Main Operation" },
   { key: "nextPlan", label: "Next Planning Operation" },
+  { key: "recipe", label: "Suggested Recipe" },
+  { key: "processTime", label: "Process Time" },
   { key: "planningArea", label: "Planning Area" },
   { key: "planner", label: "Planner" },
   { key: "unmapped", label: "Unmapped ST" },
@@ -114,7 +127,7 @@ const ALL_COLUMNS: { key: ColumnKey; label: string; sort?: SortKey; align?: "num
   { key: "operations", label: "ST Operations" },
 ];
 
-const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "routePos", "nextSt", "nextPlan", "planningArea", "planner", "remainingSt", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale"];
+const DEFAULT_COLUMNS: ColumnKey[] = ["row", "program", "part", "revision", "job", "nextOp", "routePos", "nextSt", "nextPlan", "recipe", "processTime", "planningArea", "planner", "remainingSt", "prodQty", "goodWip", "surface", "priority", "catTransit", "impactSale"];
 const STORAGE_KEY = "st-planning.phase2.saved-views.v2";
 const CURRENT_KEY = "st-planning.phase2.current-view.v2";
 
@@ -289,6 +302,20 @@ export function PlanningTable() {
       case "nextSt": return row.routeAnalysis?.nextStOperation ? <span className="next-st-badge" title={row.routeAnalysis.nextStSequence != null ? `OprSeq ${row.routeAnalysis.nextStSequence}` : undefined}>{row.routeAnalysis.nextStOperation}</span> : <span className="muted">—</span>;
       case "nextMain": return row.nextMainOperation ? <span className="main-op-badge" title={`Mapped from ${row.routeAnalysis?.nextStOperation || "ST operation"}`}>{row.nextMainOperation.label}</span> : <span className="muted">Unmapped</span>;
       case "nextPlan": return row.nextPlanningOperation ? <span className="planning-op-badge" style={row.nextPlanningOperation.color ? { borderColor: row.nextPlanningOperation.color } : undefined} title={`Planning order ${row.nextPlanningOperation.planningOrder}`}>{row.nextPlanningOperation.label}<small>{row.nextPlanningOperation.code}</small></span> : <span className="muted">No mapped planning step</span>;
+      case "recipe": {
+        const r = row.recipeSuggestion;
+        if (!r || r.status === "NO_RULE" || r.status === "NO_VALUE") return <span className="muted">—</span>;
+        if (r.status === "AMBIGUOUS") return <div className="recipe-suggestion review"><strong>AMBIGUOUS</strong><small>{r.sourceValue || "Source name"} · {r.candidates.length} matches</small></div>;
+        return <div className={`recipe-suggestion ${r.needsReview ? "review" : ""}`} title={[r.ruleCode, r.sourceField && `${r.sourceField}/${r.sourceColumn}`, r.confidence].filter(Boolean).join(" · ")}>
+          <strong>{r.recipeNo || "SOURCE"}</strong><span>{r.recipeName || r.sourceValue || "Source identifier"}</span>{r.needsReview ? <small>REVIEW</small> : null}
+        </div>;
+      }
+      case "processTime": {
+        const t = row.processTimeSuggestion;
+        if (!t || t.status === "NO_RULE" || t.status === "NO_VALUE") return <span className="muted">—</span>;
+        if (t.status === "REVIEW_REQUIRED") return <span className="time-suggestion review">RULE REVIEW</span>;
+        return <div className={`time-suggestion ${t.needsReview ? "review" : ""}`} title={[t.ruleCode,t.sourceField,t.profile].filter(Boolean).join(" · ")}><strong>{fmt(t.minutes, 1)} min</strong><small>{t.mode?.replaceAll("_"," ")}</small></div>;
+      }
       case "planningArea": return row.nextPlanningOperation ? <div className="hierarchy-cell"><strong>{row.nextPlanningOperation.scheduleArea?.label || row.nextPlanningOperation.physicalArea?.label || "—"}</strong><small>{row.nextPlanningOperation.stGroup?.label || "No ST Group"}</small></div> : <span className="muted">—</span>;
       case "planner": return row.nextPlanningOperation?.planner?.label || <span className="muted">—</span>;
       case "unmapped": return row.unmappedStOperations?.length ? <div className="unmapped-chip-row">{row.unmappedStOperations.slice(0,3).map((x) => <span key={x}>{x}</span>)}{row.unmappedStOperations.length > 3 ? <b>+{row.unmappedStOperations.length-3}</b> : null}</div> : <span className="state-pill good">MAPPED</span>;

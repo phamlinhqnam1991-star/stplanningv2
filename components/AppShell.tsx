@@ -11,6 +11,7 @@ const nav = [
   { href: "/scheduling", code: "SCH-20", label: "Scheduling" },
   { href: "/configuration", code: "CFG-90", label: "Configuration" },
   { href: "/configuration/planning-model", code: "CFG-91", label: "Planning Model" },
+  { href: "/configuration/recipe-model", code: "CFG-92", label: "Recipe & Process Time" },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -40,8 +41,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v011</strong>
-            <small>Config-Driven Planning Model</small>
+            <strong>Clean Rebuild v013</strong>
+            <small>Recipe + Process Time Model</small>
           </div>
         </div>
       </aside>
