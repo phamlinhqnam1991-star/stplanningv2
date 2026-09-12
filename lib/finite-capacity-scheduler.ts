@@ -4,6 +4,7 @@ import { aggregateProcessTime, getBatchModel, resolveBatchProposal, type BatchPr
 import { getCapacityModel, capacityInstanceCodes, capacityResource, type CapacityModel, type CapacityResourceDefinition } from "@/lib/capacity-model";
 import { getPlanningModel, type MainOperationDefinition, type PlanningModel } from "@/lib/planning-model";
 import { calculateStOutputTarget, type StOutputJobAssessment, type StOutputStep } from "@/lib/st-output-engine";
+import { getRecipeModel, type RecipeModel } from "@/lib/recipe-model";
 
 export type FiniteCapacityOptions = {
   targetDate: string;
@@ -11,7 +12,7 @@ export type FiniteCapacityOptions = {
   targetValue: number;
 };
 
-export type CapacitySegmentKind = "BLOCK" | "LOADING" | "PROCESS" | "WAIT_NDT" | "NDT" | "UNLOADING";
+export type CapacitySegmentKind = "BLOCK" | "LOADING" | "PROCESS" | "WAIT_NDT" | "NDT" | "UNLOADING" | "PAINT_SETUP" | "PAINT_APPLICATION" | "PAINT_FLASH" | "PAINT_CURE" | "PAINT_RELEASE";
 
 export type CapacityBatchSegment = {
   kind: CapacitySegmentKind;
@@ -19,6 +20,7 @@ export type CapacityBatchSegment = {
   startAt: string;
   endAt: string;
   durationMinutes: number;
+  occupiesCapacity: boolean;
 };
 
 export type CapacityTimelineEntry = {
@@ -38,6 +40,7 @@ export type CapacityTimelineEntry = {
   status: string;
   jobs: string[];
   surfaceDm2: number;
+  occupiesCapacity: boolean;
 };
 
 export type ProposedCapacityBatch = {
@@ -143,7 +146,7 @@ type MemberDraft = {
   raw: RawContext;
 };
 type JobChain = { row: StOutputJobAssessment; members: MemberDraft[]; tailLagMinutes: number; capacityReview: boolean; blockedReason: string | null };
-type BatchSegment = { kind: CapacitySegmentKind; label: string; start: number; end: number };
+type BatchSegment = { kind: CapacitySegmentKind; label: string; start: number; end: number; occupiesCapacity: boolean };
 
 type BatchNode = {
   id: string;
@@ -184,6 +187,7 @@ type OccupancyInterval = {
   surfaceDm2: number;
   segmentKind: CapacitySegmentKind;
   segmentLabel: string;
+  occupiesCapacity: boolean;
 };
 type OccupancyState = { intervals: OccupancyInterval[] };
 type Simulation = {
@@ -244,7 +248,7 @@ function inferBaseResource(code:string, model:CapacityModel): {base:string;def:C
 
 function chooseFixedInstance(def:CapacityResourceDefinition,start:number,end:number,state:OccupancyState):string{
   const instances=capacityInstanceCodes(def);
-  for(const inst of instances){if(!state.intervals.some(x=>x.baseResourceCode===def.baseResourceCode&&x.resourceInstance===inst&&overlap(start,end,x.start,x.end)))return inst;}
+  for(const inst of instances){if(!state.intervals.some(x=>x.occupiesCapacity&&x.baseResourceCode===def.baseResourceCode&&x.resourceInstance===inst&&overlap(start,end,x.start,x.end)))return inst;}
   return instances[0] || def.baseResourceCode;
 }
 
@@ -264,7 +268,7 @@ async function loadExistingOccupancy(model:CapacityModel,startAt:number,horizonE
     if(end<=startAt||start>=horizonEnd)continue;
     const resourceCode=String(x.resource_code||"UNASSIGNED"); const inf=inferBaseResource(resourceCode,model);
     const instance=inf.instance || chooseFixedInstance(inf.def,start,end,state);
-    state.intervals.push({id:`S:${x.id}:${resourceCode}`,batchRef:String(x.batch_ref||""),sourceKind:"EXISTING_SCHEDULE",baseResourceCode:inf.base,resourceInstance:instance,recipeNo:x.recipe_no==null?null:String(x.recipe_no),start,end,status:String(x.status||""),mainOperationCode:null,jobs:[],surfaceDm2:0,segmentKind:"BLOCK",segmentLabel:"Existing Schedule"});
+    state.intervals.push({id:`S:${x.id}:${resourceCode}`,batchRef:String(x.batch_ref||""),sourceKind:"EXISTING_SCHEDULE",baseResourceCode:inf.base,resourceInstance:instance,recipeNo:x.recipe_no==null?null:String(x.recipe_no),start,end,status:String(x.status||""),mainOperationCode:null,jobs:[],surfaceDm2:0,segmentKind:"BLOCK",segmentLabel:"Existing Schedule",occupiesCapacity:true});
   }
   return state;
 }
@@ -283,7 +287,7 @@ function alignWindow(t:number,duration:number,def:CapacityResourceDefinition):nu
   return null;
 }
 function instanceConflictJump(state:OccupancyState,base:string,instance:string,start:number,end:number,changeover:number,recipe:string|null):number|null{
-  const list=state.intervals.filter(x=>key(x.baseResourceCode)===key(base)&&key(x.resourceInstance)===key(instance)).sort((a,b)=>a.start-b.start);
+  const list=state.intervals.filter(x=>x.occupiesCapacity&&key(x.baseResourceCode)===key(base)&&key(x.resourceInstance)===key(instance)).sort((a,b)=>a.start-b.start);
   let prior:OccupancyInterval|null=null;
   for(const x of list){if(x.end<=start){if(!prior||x.end>prior.end)prior=x;continue;}if(overlap(start,end,x.start,x.end))return x.end;}
   if(prior&&changeover>0&&key(prior.recipeNo)!==key(recipe)&&start<prior.end+changeover*60_000)return prior.end+changeover*60_000;
@@ -291,7 +295,7 @@ function instanceConflictJump(state:OccupancyState,base:string,instance:string,s
 }
 function concurrencyJump(state:OccupancyState,base:string,start:number,end:number,maxConcurrent:number):number|null{
   if(maxConcurrent<=0)return start;
-  const list=state.intervals.filter(x=>key(x.baseResourceCode)===key(base)&&overlap(start,end,x.start,x.end)); if(list.length<maxConcurrent)return null;
+  const list=state.intervals.filter(x=>x.occupiesCapacity&&key(x.baseResourceCode)===key(base)&&overlap(start,end,x.start,x.end)); if(list.length<maxConcurrent)return null;
   const points=[start,end,...list.flatMap(x=>[Math.max(start,x.start),Math.min(end,x.end)])].sort((a,b)=>a-b);
   for(let i=0;i<points.length-1;i++){
     if(points[i+1]<=points[i])continue;const mid=(points[i]+points[i+1])/2;const active=list.filter(x=>x.start<mid&&x.end>mid);
@@ -330,7 +334,7 @@ function chemicalDurations(node:BatchNode,model:CapacityModel):{loading:number;p
   return{loading,process,ndt,unloading};
 }
 function chemicalProcessIntervals(state:OccupancyState,model:CapacityModel,base:string):OccupancyInterval[]{
-  return state.intervals.filter((x)=>key(x.baseResourceCode)===key(base)&&(x.segmentKind==="PROCESS"||(x.segmentKind==="BLOCK"&&x.sourceKind==="EXISTING_SCHEDULE"&&model.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")));
+  return state.intervals.filter((x)=>x.occupiesCapacity&&key(x.baseResourceCode)===key(base)&&(x.segmentKind==="PROCESS"||(x.segmentKind==="BLOCK"&&x.sourceKind==="EXISTING_SCHEDULE"&&model.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")));
 }
 function chemicalProcessConcurrencyJump(state:OccupancyState,model:CapacityModel,base:string,start:number,end:number):number|null{
   const maxConcurrent=model.chemicalLine.processMaxConcurrent;if(maxConcurrent<=0)return start;
@@ -362,21 +366,66 @@ function findChemicalSlot(state:OccupancyState,model:CapacityModel,def:CapacityR
     const conflictJump=instanceConflictJump(state,def.baseResourceCode,instance,t,unloadEnd,def.changeoverMinutes,node.recipeNo);
     if(conflictJump!=null&&conflictJump>t){t=conflictJump;continue;}
     const segments:BatchSegment[]=[
-      {kind:"LOADING",label:"Loading",start:loadStart,end:loadEnd},
-      {kind:"PROCESS",label:"Process",start:processStart,end:processEnd},
+      {kind:"LOADING",label:"Loading",start:loadStart,end:loadEnd,occupiesCapacity:true},
+      {kind:"PROCESS",label:"Process",start:processStart,end:processEnd,occupiesCapacity:true},
     ];
-    if(ndtStart>processEnd)segments.push({kind:"WAIT_NDT",label:"Wait for NDT slot",start:processEnd,end:ndtStart});
-    if(d.ndt>0)segments.push({kind:"NDT",label:"NDT",start:ndtStart,end:ndtEnd});
-    segments.push({kind:"UNLOADING",label:"Unloading",start:unloadStart,end:unloadEnd});
+    if(ndtStart>processEnd)segments.push({kind:"WAIT_NDT",label:"Wait for NDT slot",start:processEnd,end:ndtStart,occupiesCapacity:true});
+    if(d.ndt>0)segments.push({kind:"NDT",label:"NDT",start:ndtStart,end:ndtEnd,occupiesCapacity:true});
+    segments.push({kind:"UNLOADING",label:"Unloading",start:unloadStart,end:unloadEnd,occupiesCapacity:true});
     return{start:t,end:unloadEnd,segments};
   }
   return null;
 }
+
+function paintList(value:unknown):string[]{return Array.isArray(value)?value.map((x)=>String(x).trim()).filter(Boolean):[];}
+function paintBool(value:unknown,fallback:boolean):boolean{return typeof value==="boolean"?value:fallback;}
+function paintNum(value:unknown,fallback:number):number{const x=Number(value);return Number.isFinite(x)?Math.max(0,x):fallback;}
+function isPaintingNode(node:BatchNode,model:CapacityModel):boolean{return model.painting.enabled&&model.painting.mainOperationCodes.some((x)=>key(x)===key(node.mainOperation.code));}
+function matchingPaintRule(node:BatchNode,model:CapacityModel){
+  const main=key(node.mainOperation.code),recipe=normRecipe(node.recipeNo);
+  return model.painting.rules.find((rule)=>{
+    const c=rule.condition;const exactMain=c.mainOperation==null?"":key(c.mainOperation);const mains=paintList(c.mainOperationIn).map(key);
+    const exactRecipe=c.recipeNo==null?"":normRecipe(c.recipeNo);const recipes=paintList(c.recipeNoIn).map(normRecipe);
+    if(exactMain&&exactMain!==main)return false;if(mains.length&&!mains.includes(main))return false;
+    if(exactRecipe&&exactRecipe!==recipe)return false;if(recipes.length&&!recipes.includes(recipe))return false;return true;
+  })||null;
+}
+function paintingResourceOptions(node:BatchNode,model:CapacityModel,recipeModel:RecipeModel):string[]{
+  const rule=matchingPaintRule(node,model);const action=rule?.action||{};const configured=paintList(action.allowedResources);
+  const recipe=node.recipeNo?recipeModel.recipeByCode.get(key(node.recipeNo)):null;const recipeResources=paintList(recipe?.data.allowedResources);
+  const base=configured.length?configured:recipeResources.length?recipeResources:node.resourceOptions.length?node.resourceOptions:model.painting.defaultResources;
+  const blocked=new Set(paintList(action.disallowedResources).map(key));return [...new Set(base)].filter((x)=>!blocked.has(key(x)));
+}
+type PaintProfile={setup:number;application:number;flash:number;cure:number;release:number;flashOccupies:boolean;cureOccupies:boolean;releaseOccupies:boolean;ruleCode:string|null};
+function paintingProfile(node:BatchNode,model:CapacityModel,recipeModel:RecipeModel):PaintProfile{
+  const rule=matchingPaintRule(node,model);const action=rule?.action||{};const recipe=node.recipeNo?recipeModel.recipeByCode.get(key(node.recipeNo)):null;
+  const stages=recipe?.stagesMinutes||{};let stageFlash=0,stageCure=0;
+  if(model.painting.useRecipeStages){for(const [name,value] of Object.entries(stages)){const minutes=Number(value);if(!Number.isFinite(minutes)||minutes<=0)continue;const k=key(name);if(k.includes("DEGAS")||k.includes("FLASH")||k.includes("WAIT"))stageFlash+=minutes;else if(k.includes("CUR")||k.includes("BAKE")||k.includes("OVEN"))stageCure+=minutes;}}
+  let setup=paintNum(action.setupMinutes,model.painting.setupMinutes);let flash=paintNum(action.flashMinutes,stageFlash>0?stageFlash:model.painting.flashMinutes);let cure=paintNum(action.cureMinutes,stageCure>0?stageCure:model.painting.cureMinutes);let release=paintNum(action.releaseMinutes,model.painting.releaseMinutes);
+  const total=Math.max(0,node.durationMinutes);const fixed=setup+flash+cure+release;let application=Math.max(0,total-fixed);
+  if(total>0&&fixed>total){const scale=total/fixed;setup*=scale;flash*=scale;cure*=scale;release*=scale;application=0;}
+  return{setup,application,flash,cure,release,flashOccupies:paintBool(action.flashOccupiesCabin,model.painting.flashOccupiesCabin),cureOccupies:paintBool(action.cureOccupiesCabin,model.painting.cureOccupiesCabin),releaseOccupies:paintBool(action.releaseOccupiesCabin,model.painting.releaseOccupiesCabin),ruleCode:rule?.code||null};
+}
+type PaintSlot={start:number;end:number;segments:BatchSegment[];ruleCode:string|null};
+function findPaintingSlot(state:OccupancyState,model:CapacityModel,recipeModel:RecipeModel,def:CapacityResourceDefinition,instance:string,readyAt:number,node:BatchNode,horizonEnd:number):PaintSlot|null{
+  const p=paintingProfile(node,model,recipeModel);const durations:[CapacitySegmentKind,string,number,boolean][]=[
+    ["PAINT_SETUP","Setup",p.setup,true],["PAINT_APPLICATION","Application",p.application,true],["PAINT_FLASH","Flash / Wait",p.flash,p.flashOccupies],["PAINT_CURE","Cure",p.cure,p.cureOccupies],["PAINT_RELEASE","Release",p.release,p.releaseOccupies],
+  ];const elapsed=durations.reduce((sum,x)=>sum+x[2],0)*60_000;let t=readyAt;
+  for(let guard=0;guard<2000&&t+elapsed<=horizonEnd;guard++){
+    const aligned=alignWindow(t,elapsed,def);if(aligned==null)return null;t=aligned;let cursor=t;const segments:BatchSegment[]=[];
+    for(const [kind,label,minutes,occupiesCapacity] of durations){const end=cursor+Math.max(0,minutes)*60_000;if(end>cursor)segments.push({kind,label,start:cursor,end,occupiesCapacity});cursor=end;}
+    let jump:number|null=null;let firstCapacity=true;
+    for(const seg of segments){if(!seg.occupiesCapacity)continue;const changeover=firstCapacity?def.changeoverMinutes:0;firstCapacity=false;const iJump=instanceConflictJump(state,def.baseResourceCode,instance,seg.start,seg.end,changeover,node.recipeNo);if(iJump!=null&&iJump>seg.start){jump=t+(iJump-seg.start);break;}const cJump=concurrencyJump(state,def.baseResourceCode,seg.start,seg.end,def.maxConcurrent);if(cJump!=null&&cJump>seg.start){jump=t+(cJump-seg.start);break;}}
+    if(jump!=null&&jump>t){t=jump;continue;}return{start:t,end:cursor,segments,ruleCode:p.ruleCode};
+  }
+  return null;
+}
+
 function addNodeOccupancy(state:OccupancyState,node:BatchNode,base:string,instance:string):void{
   const sourceKind:CapacityTimelineEntry["sourceKind"]=node.sourceKind==="PROPOSED_BATCH"?"PROPOSED_BATCH":"EXISTING_BATCH";
   const jobs=node.members.map((x)=>x.row.jobNum);const surface=node.members.reduce((sum,x)=>sum+x.row.surfaceDm2,0);
-  const segments=node.segments.length?node.segments:(node.start!=null&&node.end!=null?[{kind:"BLOCK" as const,label:"Process Block",start:node.start,end:node.end}]:[]);
-  for(let i=0;i<segments.length;i++){const seg=segments[i];if(seg.end<=seg.start)continue;state.intervals.push({id:`SIM:${node.id}:${i}`,batchRef:node.batchNo,sourceKind,baseResourceCode:base,resourceInstance:instance,recipeNo:node.recipeNo,start:seg.start,end:seg.end,status:node.status,mainOperationCode:node.mainOperation.code,jobs,surfaceDm2:surface,segmentKind:seg.kind,segmentLabel:seg.label});}
+  const segments=node.segments.length?node.segments:(node.start!=null&&node.end!=null?[{kind:"BLOCK" as const,label:"Process Block",start:node.start,end:node.end,occupiesCapacity:true}]:[]);
+  for(let i=0;i<segments.length;i++){const seg=segments[i];if(seg.end<=seg.start)continue;state.intervals.push({id:`SIM:${node.id}:${i}`,batchRef:node.batchNo,sourceKind,baseResourceCode:base,resourceInstance:instance,recipeNo:node.recipeNo,start:seg.start,end:seg.end,status:node.status,mainOperationCode:node.mainOperation.code,jobs,surfaceDm2:surface,segmentKind:seg.kind,segmentLabel:seg.label,occupiesCapacity:seg.occupiesCapacity});}
 }
 
 function stepMain(step:StOutputStep):MainOperationDefinition|null{return step.mainOperation || null;}
@@ -389,7 +438,8 @@ function buildChains(rows:StOutputJobAssessment[],rawMap:Map<number,RawContext>,
     for(let i=0;i<row.steps.length;i++){
       const step=row.steps[i];const main=stepMain(step);const duration=Math.max(0,step.durationMinutes||0);
       if(!main?.scheduleEnabled){lag+=duration;continue;}
-      if(!main.resources.length){
+      const hasPaintDefault=capacityModel.painting.enabled&&capacityModel.painting.mainOperationCodes.some((x)=>key(x)===key(main.code))&&capacityModel.painting.defaultResources.length>0;
+      if(!main.resources.length&&!hasPaintDefault){
         if(capacityModel.unmappedResourcePolicy==="BLOCK"){blockedReason=`NO_RESOURCE_MAPPING:${main.code}`;}
         else {capacityReview=true;lag+=duration;}
         continue;
@@ -446,7 +496,7 @@ function predecessorReady(node:BatchNode,nodeMap:Map<string,BatchNode>,memberNod
   if(node.fixedStart!=null&&node.fixedStart<ready)conflict=true;return{ready,conflict};
 }
 
-function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:OccupancyState,capacityModel:CapacityModel,scenarioStart:number,horizonEnd:number):OccupancyState{
+function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:OccupancyState,capacityModel:CapacityModel,recipeModel:RecipeModel,scenarioStart:number,horizonEnd:number):OccupancyState{
   const state:OccupancyState={intervals:initial.intervals.map(x=>({...x,jobs:[...x.jobs]}))};const map=new Map(nodes.map(x=>[x.id,x]));const pending=new Set(nodes.map(x=>x.id));
   let proposalSeq=0;
   while(pending.size){
@@ -457,26 +507,31 @@ function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:O
     if(node.sourceKind==="FIXED_SCHEDULE"){
       node.start=node.fixedStart;node.end=node.fixedEnd;if(dep.conflict){node.status="DEPENDENCY_CONFLICT";node.reason="FIXED_SCHEDULE_STARTS_BEFORE_JOB_IS_READY";}else node.status="FIXED";
       const match=state.intervals.find(x=>key(x.batchRef)===key(node.batchNo)&&node.start!=null&&node.end!=null&&overlap(node.start,node.end,x.start,x.end));if(match){node.resourceBase=match.baseResourceCode;node.resourceInstance=match.resourceInstance;}
-      if(node.start!=null&&node.end!=null)node.segments=[{kind:"BLOCK",label:"Existing Scheduled Block",start:node.start,end:node.end}];
+      if(node.start!=null&&node.end!=null)node.segments=[{kind:"BLOCK",label:"Existing Scheduled Block",start:node.start,end:node.end,occupiesCapacity:true}];
       continue;
     }
     if(!Number.isFinite(dep.ready)){node.status="DEPENDENCY_CONFLICT";node.reason="PREDECESSOR_NOT_SCHEDULED";continue;}
-    let best:{start:number;end:number;base:string;instance:string;def:CapacityResourceDefinition;segments:BatchSegment[]}|null=null;
-    for(const resourceCode of node.resourceOptions){
+    let best:{start:number;end:number;base:string;instance:string;def:CapacityResourceDefinition;segments:BatchSegment[];paintRuleCode?:string|null}|null=null;
+    const paintNode=isPaintingNode(node,capacityModel);const resourceOptions=paintNode?paintingResourceOptions(node,capacityModel,recipeModel):node.resourceOptions;node.resourceOptions=resourceOptions;
+    for(const resourceCode of resourceOptions){
       const def=capacityResource(capacityModel,resourceCode);
       for(const inst of capacityInstanceCodes(def)){
         if(capacityModel.chemicalLine.enabled&&key(def.baseResourceCode)===key(capacityModel.chemicalLine.resourceCode)){
           const slot=findChemicalSlot(state,capacityModel,def,inst,dep.ready,node,horizonEnd);
           if(slot&&(!best||slot.start<best.start||(slot.start===best.start&&def.sortOrder<best.def.sortOrder)))best={...slot,base:def.baseResourceCode,instance:inst,def};
+        }else if(paintNode){
+          const slot=findPaintingSlot(state,capacityModel,recipeModel,def,inst,dep.ready,node,horizonEnd);
+          if(slot&&(!best||slot.start<best.start||(slot.start===best.start&&def.sortOrder<best.def.sortOrder)))best={...slot,base:def.baseResourceCode,instance:inst,def,paintRuleCode:slot.ruleCode};
         }else{
           const slot=findSlot(state,def,inst,dep.ready,node.durationMinutes,node.recipeNo,horizonEnd);
-          if(slot&&(!best||slot.start<best.start||(slot.start===best.start&&def.sortOrder<best.def.sortOrder)))best={...slot,base:def.baseResourceCode,instance:inst,def,segments:[{kind:"BLOCK",label:"Process Block",start:slot.start,end:slot.end}]};
+          if(slot&&(!best||slot.start<best.start||(slot.start===best.start&&def.sortOrder<best.def.sortOrder)))best={...slot,base:def.baseResourceCode,instance:inst,def,segments:[{kind:"BLOCK",label:"Process Block",start:slot.start,end:slot.end,occupiesCapacity:true}]};
         }
       }
     }
     if(!best){node.status="UNSCHEDULED";node.reason=node.resourceOptions.length?"NO_FINITE_CAPACITY_SLOT_IN_HORIZON":"NO_RESOURCE_MAPPING";continue;}
     node.start=best.start;node.end=best.end;node.resourceBase=best.base;node.resourceInstance=best.instance;node.segments=best.segments;node.durationMinutes=Math.round((best.end-best.start)/60_000);node.status=node.mustStartBy!=null&&best.start>node.mustStartBy?"LATE_START":"ON_TIME";node.reason=node.status==="LATE_START"?"STARTS_AFTER_BACKWARD_LATEST_START":null;
     if(node.segments.some((seg)=>seg.kind==="WAIT_NDT"))node.warnings=[...new Set([...node.warnings,"NDT_START_SPACING_ADDED_WAIT"])];
+    if(paintNode){node.warnings=[...new Set([...node.warnings,"PAINT_SEGMENTED_SCHEDULER"])] ;if(best.paintRuleCode)node.warnings=[...new Set([...node.warnings,`PAINT_RULE:${best.paintRuleCode}`])];}
     if(node.sourceKind==="PROPOSED_BATCH"){const short=node.mainOperation.shortCode||node.mainOperation.code.slice(0,3);node.batchNo=`${capacityModel.proposedBatchPrefix}_${short}_${String(++proposalSeq).padStart(3,"0")}`;}
     addNodeOccupancy(state,node,best.base,best.instance);
   }
@@ -494,14 +549,14 @@ function evaluateJobs(chains:JobChain[],nodes:BatchNode[],memberNode:Map<string,
 }
 
 function timelineRows(state:OccupancyState,model:CapacityModel,startAt:number,horizonEnd:number):CapacityTimelineEntry[]{
-  return state.intervals.filter(x=>overlap(startAt,horizonEnd,x.start,x.end)).sort((a,b)=>a.start-b.start||a.resourceInstance.localeCompare(b.resourceInstance)).map(x=>({id:x.id,batchNo:x.batchRef,sourceKind:x.sourceKind,baseResourceCode:x.baseResourceCode,resourceInstance:x.resourceInstance,resourceLabel:capacityResource(model,x.baseResourceCode).label,mainOperationCode:x.mainOperationCode,recipeNo:x.recipeNo,startAt:wallIso(x.start)!,endAt:wallIso(x.end)!,durationMinutes:Math.round((x.end-x.start)/60_000),segmentKind:x.segmentKind,segmentLabel:x.segmentLabel,status:x.status,jobs:x.jobs,surfaceDm2:x.surfaceDm2}));
+  return state.intervals.filter(x=>overlap(startAt,horizonEnd,x.start,x.end)).sort((a,b)=>a.start-b.start||a.resourceInstance.localeCompare(b.resourceInstance)).map(x=>({id:x.id,batchNo:x.batchRef,sourceKind:x.sourceKind,baseResourceCode:x.baseResourceCode,resourceInstance:x.resourceInstance,resourceLabel:capacityResource(model,x.baseResourceCode).label,mainOperationCode:x.mainOperationCode,recipeNo:x.recipeNo,startAt:wallIso(x.start)!,endAt:wallIso(x.end)!,durationMinutes:Math.round((x.end-x.start)/60_000),segmentKind:x.segmentKind,segmentLabel:x.segmentLabel,status:x.status,jobs:x.jobs,surfaceDm2:x.surfaceDm2,occupiesCapacity:x.occupiesCapacity}));
 }
 function resourceSummary(state:OccupancyState,nodes:BatchNode[],model:CapacityModel,startAt:number,cutoff:number):CapacityResourceSummary[]{
   const defs=[...model.resourceList];const usedCodes=new Set(state.intervals.map(x=>key(x.baseResourceCode)));for(const c of usedCodes)if(!defs.some(d=>key(d.baseResourceCode)===c))defs.push(capacityResource(model,c));
   return defs.sort((a,b)=>a.sortOrder-b.sortOrder||a.code.localeCompare(b.code)).map(def=>{
-    const intervals=state.intervals.filter(x=>key(x.baseResourceCode)===key(def.baseResourceCode));
-    const existing=intervals.filter(x=>x.sourceKind==="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0);
-    const simulated=intervals.filter(x=>x.sourceKind!=="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0);
+    const intervals=state.intervals.filter(x=>key(x.baseResourceCode)===key(def.baseResourceCode));const capacityIntervals=intervals.filter(x=>x.occupiesCapacity);
+    const existing=capacityIntervals.filter(x=>x.sourceKind==="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0);
+    const simulated=capacityIntervals.filter(x=>x.sourceKind!=="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0);
     const isChemical=model.chemicalLine.enabled&&key(def.baseResourceCode)===key(model.chemicalLine.resourceCode);
     const available=Math.max(0,(cutoff-startAt)/60_000*(isChemical?def.instanceCount:def.maxConcurrent));
     const processExisting=isChemical?intervals.filter(x=>x.sourceKind==="EXISTING_SCHEDULE"&&model.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0):0;
@@ -512,25 +567,25 @@ function resourceSummary(state:OccupancyState,nodes:BatchNode[],model:CapacityMo
   });
 }
 
-async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,rawMap:Map<number,RawContext>,planningModel:PlanningModel,batchModel:Awaited<ReturnType<typeof getBatchModel>>,capacityModel:CapacityModel,baseOccupancy:OccupancyState,scenarioStart:number,cutoff:number,horizonEnd:number):Promise<Simulation>{
-  const chains=buildChains(rows,rawMap,planningModel,batchModel,capacityModel);const {nodes,memberNode}=buildNodes(chains,capacityModel);const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,scenarioStart,horizonEnd);const jobs=evaluateJobs(chains,nodes,memberNode,scenarioStart,cutoff);const feasiblePlannedSurface=jobs.filter(x=>x.sourceStatus==="PLANNED"&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const feasibleCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const selectedCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)).reduce((s,x)=>s+x.surfaceDm2,0);const warnings:string[]=[];if(chains.some(x=>x.capacityReview))warnings.push("UNMAPPED_AREA_CAPACITY_REVIEW");if(nodes.some(x=>x.status==="UNSCHEDULED"))warnings.push("ONE_OR_MORE_BATCHES_HAVE_NO_CAPACITY_SLOT");if(nodes.some(x=>x.status==="DEPENDENCY_CONFLICT"))warnings.push("SCHEDULE_PRECEDENCE_CONFLICT");if(capacityModel.chemicalLine.enabled&&baseOccupancy.intervals.some(x=>key(x.baseResourceCode)===key(capacityModel.chemicalLine.resourceCode))&&capacityModel.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")warnings.push("EXISTING_CHEMICAL_SCHEDULE_IS_TREATED_AS_CONSERVATIVE_PROCESS_OCCUPANCY");return{nodes,jobs,timeline:timelineRows(state,capacityModel,scenarioStart,horizonEnd),resources:resourceSummary(state,nodes,capacityModel,scenarioStart,cutoff),feasiblePlannedSurface,feasibleCandidateSurface,selectedCandidateSurface,warnings};
+async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,rawMap:Map<number,RawContext>,planningModel:PlanningModel,batchModel:Awaited<ReturnType<typeof getBatchModel>>,capacityModel:CapacityModel,recipeModel:RecipeModel,baseOccupancy:OccupancyState,scenarioStart:number,cutoff:number,horizonEnd:number):Promise<Simulation>{
+  const chains=buildChains(rows,rawMap,planningModel,batchModel,capacityModel);const {nodes,memberNode}=buildNodes(chains,capacityModel);const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,recipeModel,scenarioStart,horizonEnd);const jobs=evaluateJobs(chains,nodes,memberNode,scenarioStart,cutoff);const feasiblePlannedSurface=jobs.filter(x=>x.sourceStatus==="PLANNED"&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const feasibleCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const selectedCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)).reduce((s,x)=>s+x.surfaceDm2,0);const warnings:string[]=[];if(chains.some(x=>x.capacityReview))warnings.push("UNMAPPED_AREA_CAPACITY_REVIEW");if(nodes.some(x=>x.status==="UNSCHEDULED"))warnings.push("ONE_OR_MORE_BATCHES_HAVE_NO_CAPACITY_SLOT");if(nodes.some(x=>x.status==="DEPENDENCY_CONFLICT"))warnings.push("SCHEDULE_PRECEDENCE_CONFLICT");if(capacityModel.chemicalLine.enabled&&baseOccupancy.intervals.some(x=>key(x.baseResourceCode)===key(capacityModel.chemicalLine.resourceCode))&&capacityModel.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")warnings.push("EXISTING_CHEMICAL_SCHEDULE_IS_TREATED_AS_CONSERVATIVE_PROCESS_OCCUPANCY");return{nodes,jobs,timeline:timelineRows(state,capacityModel,scenarioStart,horizonEnd),resources:resourceSummary(state,nodes,capacityModel,scenarioStart,cutoff),feasiblePlannedSurface,feasibleCandidateSurface,selectedCandidateSurface,warnings};
 }
 
-function nodeToPublic(node:BatchNode):ProposedCapacityBatch{return{id:node.id,batchNo:node.batchNo,sourceKind:node.sourceKind,mainOperationCode:node.mainOperation.code,mainOperationLabel:node.mainOperation.label,batchKey:node.batchKey,recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),totalQty:node.members.reduce((s,x)=>s+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((s,x)=>s+x.row.surfaceDm2,0),durationMinutes:node.durationMinutes,batchRuleCode:node.ruleCode,resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,startAt:wallIso(node.start),endAt:wallIso(node.end),mustStartBy:wallIso(node.mustStartBy),status:node.status,reason:node.reason,warnings:node.warnings,segments:node.segments.map(seg=>({kind:seg.kind,label:seg.label,startAt:wallIso(seg.start)!,endAt:wallIso(seg.end)!,durationMinutes:Math.round((seg.end-seg.start)/60_000)}))};}
+function nodeToPublic(node:BatchNode):ProposedCapacityBatch{return{id:node.id,batchNo:node.batchNo,sourceKind:node.sourceKind,mainOperationCode:node.mainOperation.code,mainOperationLabel:node.mainOperation.label,batchKey:node.batchKey,recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),totalQty:node.members.reduce((s,x)=>s+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((s,x)=>s+x.row.surfaceDm2,0),durationMinutes:node.durationMinutes,batchRuleCode:node.ruleCode,resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,startAt:wallIso(node.start),endAt:wallIso(node.end),mustStartBy:wallIso(node.mustStartBy),status:node.status,reason:node.reason,warnings:node.warnings,segments:node.segments.map(seg=>({kind:seg.kind,label:seg.label,startAt:wallIso(seg.start)!,endAt:wallIso(seg.end)!,durationMinutes:Math.round((seg.end-seg.start)/60_000),occupiesCapacity:seg.occupiesCapacity}))};}
 
 export async function calculateFiniteCapacityTarget(options:FiniteCapacityOptions):Promise<FiniteCapacityResult>{
-  const [base,planningModel,batchModel,capacityModel,bootstrap]=await Promise.all([
+  const [base,planningModel,batchModel,capacityModel,recipeModel,bootstrap]=await Promise.all([
     calculateStOutputTarget({targetDate:options.targetDate,cutoffTime:options.cutoffTime,targetValue:options.targetValue}),
-    getPlanningModel(),getBatchModel(),getCapacityModel(),getConfigBootstrap(),
+    getPlanningModel(),getBatchModel(),getCapacityModel(),getRecipeModel(),getConfigBootstrap(),
   ]);
   const cutoff=wallDateTime(options.targetDate,options.cutoffTime);const routeSnapshot=parseWall(base.routeSnapshotAt);const configuredStart=wallDateTime(addDays(options.targetDate,-capacityModel.lookbackDays),capacityModel.scenarioStartTime);const scenarioStart=Math.max(configuredStart,routeSnapshot||configuredStart);const horizonEnd=cutoff+capacityModel.spillHours*60*60_000;
   const plannedRows=base.rows.filter(x=>x.outputStatus==="PLANNED");const candidates=candidateSort(base.rows.filter(x=>x.outputStatus==="NEED_PLAN"&&!x.needsReview&&x.surfaceDm2>0));const candidateByJob=new Map(candidates.map(x=>[x.jobNum,x]));const selected:Set<number>=new Set();
   for(const job of base.recommendedJobNums){const row=candidateByJob.get(job);if(row)selected.add(row.planningJobId);if(selected.size>=capacityModel.maxCandidateJobs)break;}
   const potential=candidates.slice(0,capacityModel.maxCandidateJobs);const ids=[...new Set([...plannedRows,...potential].map(x=>x.planningJobId))];const planningProfile=bootstrap.sources.PLANNING;const rawMap=await loadRawContexts(ids,planningProfile.sheetName||planningProfile.displayName);const existing=await loadExistingOccupancy(capacityModel,scenarioStart,horizonEnd);
   let sim:Simulation|null=null;let iteration=0;let cursor=0;
-  while(iteration++<8){const selectedRows=potential.filter(x=>selected.has(x.planningJobId));const capacityRows=[...plannedRows,...selectedRows];sim=await simulate(capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,existing,scenarioStart,cutoff,horizonEnd);const forecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;if(forecast>=options.targetValue)break;let need=Math.max(0,options.targetValue-forecast)*capacityModel.candidateSurfaceMultiplier;let added=0;while(cursor<potential.length&&added<need&&selected.size<capacityModel.maxCandidateJobs){const row=potential[cursor++];if(selected.has(row.planningJobId))continue;selected.add(row.planningJobId);added+=row.surfaceDm2;}if(added<=0)break;}
+  while(iteration++<8){const selectedRows=potential.filter(x=>selected.has(x.planningJobId));const capacityRows=[...plannedRows,...selectedRows];sim=await simulate(capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd);const forecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;if(forecast>=options.targetValue)break;let need=Math.max(0,options.targetValue-forecast)*capacityModel.candidateSurfaceMultiplier;let added=0;while(cursor<potential.length&&added<need&&selected.size<capacityModel.maxCandidateJobs){const row=potential[cursor++];if(selected.has(row.planningJobId))continue;selected.add(row.planningJobId);added+=row.surfaceDm2;}if(added<=0)break;}
   const finalSelectedRows=potential.filter(x=>selected.has(x.planningJobId));
-  sim=await simulate([...plannedRows,...finalSelectedRows],selected,rawMap,planningModel,batchModel,capacityModel,existing,scenarioStart,cutoff,horizonEnd);
+  sim=await simulate([...plannedRows,...finalSelectedRows],selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd);
   const finiteForecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;const remainingGap=Math.max(0,options.targetValue-finiteForecast);const contributing=sim.jobs.filter(x=>x.contributes&&selected.has(x.planningJobId));const anyReview=contributing.some(x=>x.capacityReview);const targetFeasibility:FiniteCapacityResult["targetFeasibility"]=remainingGap>0?"NOT_FEASIBLE":anyReview?"PROVISIONAL":"CONFIRMED";const publicBatches=sim.nodes.map(nodeToPublic).sort((a,b)=>(a.startAt||"9999").localeCompare(b.startAt||"9999")||(a.mustStartBy||"9999").localeCompare(b.mustStartBy||"9999"));const warnings=[...new Set(sim.warnings)];if(targetFeasibility==="PROVISIONAL")warnings.push("TARGET_REACHED_BUT_ONE_OR_MORE_CONTRIBUTING_STEPS_HAVE_NO_CONFIGURED_FINITE_RESOURCE");if(remainingGap>0)warnings.push(`FINITE_CAPACITY_GAP:${Math.round(remainingGap)}`);
   const processTimeForecast=base.summary.actualSurface+base.summary.committedSurface+sumSurface(plannedRows)+sim.selectedCandidateSurface;
   return{targetDate:options.targetDate,cutoffTime:options.cutoffTime,cutoffAt:wallIso(cutoff)!,targetValue:options.targetValue,scenarioStartAt:wallIso(scenarioStart)!,horizonEndAt:wallIso(horizonEnd)!,endpointOperation:base.endpointOperation,targetFeasibility,summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length},selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,warnings};

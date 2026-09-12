@@ -36,6 +36,30 @@ export type ChemicalLineCapacityModel = {
   existingSchedulePolicy: "CONSERVATIVE_PROCESS_BLOCK" | "PHYSICAL_ONLY";
 };
 
+export type PaintingCapacityRule = {
+  code: string;
+  name: string;
+  priority: number;
+  condition: JsonMap;
+  action: JsonMap;
+};
+
+export type PaintingCapacityModel = {
+  enabled: boolean;
+  mainOperationCodes: string[];
+  defaultResources: string[];
+  setupMinutes: number;
+  flashMinutes: number;
+  cureMinutes: number;
+  releaseMinutes: number;
+  useRecipeStages: boolean;
+  flashOccupiesCabin: boolean;
+  cureOccupiesCabin: boolean;
+  releaseOccupiesCabin: boolean;
+  existingSchedulePolicy: "CONSERVATIVE_FULL_BLOCK" | "PHYSICAL_ONLY";
+  rules: PaintingCapacityRule[];
+};
+
 export type CapacityModel = {
   resources: Record<string, CapacityResourceDefinition>;
   resourceList: CapacityResourceDefinition[];
@@ -50,6 +74,7 @@ export type CapacityModel = {
   unmappedResourcePolicy: "BLOCK" | "REVIEW_UNCONSTRAINED";
   groupBySourceOperation: boolean;
   chemicalLine: ChemicalLineCapacityModel;
+  painting: PaintingCapacityModel;
 };
 
 function record(value: unknown): JsonMap {
@@ -83,6 +108,14 @@ export async function getCapacityModel(): Promise<CapacityModel> {
       loadingQtyThreshold: 501, loadingSurfaceThresholdDm2: 5001, unloadingDefaultMinutes: 30, unloadingHeavyMinutes: 45,
       unloadingQtyThreshold: 501, unloadingSurfaceThresholdDm2: 5001, existingSchedulePolicy: "CONSERVATIVE_PROCESS_BLOCK",
     },
+    painting: {
+      enabled: true,
+      mainOperationCodes: ["PRIMER","PRIMER2","PRIMER3","TOPCOAT1","TOPCOAT2","ANTI_ABRASION","PAINT_MARKING","VARNISH"],
+      defaultResources: ["CAB1","CAB2","CAB3","CAB4"],
+      setupMinutes: 30, flashMinutes: 30, cureMinutes: 60, releaseMinutes: 15, useRecipeStages: true,
+      flashOccupiesCabin: true, cureOccupiesCabin: true, releaseOccupiesCabin: true,
+      existingSchedulePolicy: "CONSERVATIVE_FULL_BLOCK", rules: [],
+    },
   };
   try {
     const result = await query(`
@@ -96,9 +129,21 @@ export async function getCapacityModel(): Promise<CapacityModel> {
           SELECT jsonb_object_agg(s.setting_key, s.value_json)
           FROM config_settings s
           WHERE s.enabled=true AND s.category='CAPACITY_MODEL'
-        ), '{}'::jsonb) AS settings`);
+        ), '{}'::jsonb) AS settings,
+        COALESCE((
+          SELECT jsonb_agg(to_jsonb(r) ORDER BY r.priority, r.code)
+          FROM config_rules r
+          WHERE r.enabled=true AND r.rule_type='PAINT_CAPACITY'
+        ), '[]'::jsonb) AS paint_rules`);
     const row = (result.rows[0] || {}) as Record<string, unknown>;
     const settings = record(row.settings);
+    const paintRules = ((Array.isArray(row.paint_rules) ? row.paint_rules : []) as Record<string, unknown>[]).map((r) => ({
+      code: String(r.code || ""),
+      name: String(r.name || r.code || ""),
+      priority: Number(r.priority || 100),
+      condition: record(r.condition_json),
+      action: record(r.action_json),
+    }));
     const list = ((Array.isArray(row.resources) ? row.resources : []) as Record<string, unknown>[]).map((x) => {
       const data = record(x.data);
       const count = Math.max(1, Math.min(64, Math.trunc(num(data.instanceCount, 1))));
@@ -143,6 +188,21 @@ export async function getCapacityModel(): Promise<CapacityModel> {
         unloadingQtyThreshold: Math.max(0, num(settings["capacity.chemicalLineUnloadingQtyThreshold"], defaults.chemicalLine.unloadingQtyThreshold)),
         unloadingSurfaceThresholdDm2: Math.max(0, num(settings["capacity.chemicalLineUnloadingSurfaceThresholdDm2"], defaults.chemicalLine.unloadingSurfaceThresholdDm2)),
         existingSchedulePolicy: key(settings["capacity.chemicalLineExistingSchedulePolicy"]) === "PHYSICAL_ONLY" ? "PHYSICAL_ONLY" : "CONSERVATIVE_PROCESS_BLOCK",
+      },
+       painting: {
+        enabled: bool(settings["capacity.paintingSegmented"], defaults.painting.enabled),
+        mainOperationCodes: stringArray(settings["capacity.paintingMainOperations"], defaults.painting.mainOperationCodes),
+        defaultResources: stringArray(settings["capacity.paintingDefaultResources"], defaults.painting.defaultResources),
+        setupMinutes: Math.max(0, num(settings["capacity.paintingSetupMinutes"], defaults.painting.setupMinutes)),
+        flashMinutes: Math.max(0, num(settings["capacity.paintingFlashMinutes"], defaults.painting.flashMinutes)),
+        cureMinutes: Math.max(0, num(settings["capacity.paintingCureMinutes"], defaults.painting.cureMinutes)),
+        releaseMinutes: Math.max(0, num(settings["capacity.paintingReleaseMinutes"], defaults.painting.releaseMinutes)),
+        useRecipeStages: bool(settings["capacity.paintingUseRecipeStages"], defaults.painting.useRecipeStages),
+        flashOccupiesCabin: bool(settings["capacity.paintingFlashOccupiesCabin"], defaults.painting.flashOccupiesCabin),
+        cureOccupiesCabin: bool(settings["capacity.paintingCureOccupiesCabin"], defaults.painting.cureOccupiesCabin),
+        releaseOccupiesCabin: bool(settings["capacity.paintingReleaseOccupiesCabin"], defaults.painting.releaseOccupiesCabin),
+        existingSchedulePolicy: key(settings["capacity.paintingExistingSchedulePolicy"]) === "PHYSICAL_ONLY" ? "PHYSICAL_ONLY" : "CONSERVATIVE_FULL_BLOCK",
+        rules: paintRules,
       },
     };
   } catch {

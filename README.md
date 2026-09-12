@@ -100,3 +100,11 @@ All values marked `seedVersion=v017`, `assumption=true` or `assumptionBaseline=t
 v018 replaces the Chemical Line one-block capacity approximation with `Loading → Process → Wait NDT → NDT → Unloading` simulation on 6 Flybars. It enforces maximum 3 concurrent Process segments, 5h NDT for Recipe `001/009/016/025`, and 1h30 minimum NDT-start spacing. Loading/Unloading tiers and all Chemical Line constraints are configuration-driven.
 
 Upgrade from v017: run only `db/31_chemical_line_segmented_v018.sql` (3 statements). Optional verification: `db/verify_v018_chemical.sql` (6 queries).
+
+---
+
+# ST Planning Clean Rebuild v019 — Detailed Painting / Cabin Scheduler
+
+v019 replaces wet-paint one-block capacity approximation with `Setup → Application → Flash/Wait → Cure → Release` simulation across CAB1–CAB4. Cabin eligibility can be configured by Main Operation and Recipe No.; Recipe Master stage times are reused where available while the resolved total Process Time remains authoritative.
+
+Upgrade from v018: run only `db/32_painting_segmented_v019.sql` (4 statements). Optional verification: `db/verify_v019_painting.sql` (6 queries).
