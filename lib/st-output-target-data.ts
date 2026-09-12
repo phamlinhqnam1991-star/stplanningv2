@@ -20,10 +20,20 @@ export type StOutputBatchAssignment = {
   nextPlanningOperation: string | null;
 };
 
+export type StOutputExecutionActual = {
+  jobNum:string; batchId:string|null; batchNo:string|null; mainOperationCode:string; routeOccurrenceKey:string; routePosition:number|null; state:string; actualStart:string|null; actualEnd:string|null; goodQty:number|null; rejectQty:number|null;
+};
+
+export type StOutputInspectionActual = {
+  jobNum:string; routeOccurrenceKey:string; routePosition:number|null; operationCode:string; inspectionType:string; status:string; actualStart:string|null; actualEnd:string|null; resultCode:string|null; version:number;
+};
+
 export type StOutputTargetData = {
   rows: StOutputSourceJobRow[];
   operationsByRouteId: Map<number, RouteOperationForAnalysis[]>;
   batchesByJob: Map<string, StOutputBatchAssignment[]>;
+  executionsByJob: Map<string, StOutputExecutionActual[]>;
+  inspectionsByJob: Map<string, StOutputInspectionActual[]>;
   warnings: string[];
   duplicateJobNums: string[];
 };
@@ -196,10 +206,20 @@ export async function loadStOutputTargetData(
        FROM planning_batch_jobs j
        JOIN planning_batches b ON b.id=j.batch_id
        LEFT JOIN LATERAL (
-         SELECT x.schedule_date,x.start_time,x.end_time,x.duration_minutes,x.status
-         FROM v_active_schedule_blocks x
-         WHERE x.batch_ref=b.batch_no
-         ORDER BY x.schedule_date DESC,x.source_row_no DESC
+         SELECT q.schedule_date,q.start_time,q.end_time,q.duration_minutes,q.status
+         FROM (
+           SELECT r.schedule_date, r.start_at::time AS start_time, r.end_at::time AS end_time,
+                  EXTRACT(EPOCH FROM (r.end_at-r.start_at))/60.0 AS duration_minutes, 'ERP_RESERVED'::text AS status,
+                  0 AS source_order, r.updated_at AS order_at
+           FROM erp_schedule_reservations r
+           WHERE r.batch_id=b.id AND r.state='ACTIVE'
+           UNION ALL
+           SELECT x.schedule_date,x.start_time,x.end_time,x.duration_minutes,x.status,1 AS source_order,
+                  (x.schedule_date::text||' '||COALESCE(x.start_time::text,'00:00'))::timestamp AS order_at
+           FROM v_active_schedule_blocks x
+           WHERE x.batch_ref=b.batch_no
+         ) q
+         ORDER BY q.source_order,q.order_at DESC
          LIMIT 1
        ) s ON true
        WHERE j.job_num=ANY($1::text[])
@@ -237,10 +257,37 @@ export async function loadStOutputTargetData(
     }
   }
 
+  const executionsByJob = new Map<string, StOutputExecutionActual[]>();
+  const inspectionsByJob = new Map<string, StOutputInspectionActual[]>();
+  if (jobNums.length) {
+    const executions = await query(`
+      SELECT e.job_num,e.batch_id::text,b.batch_no,e.main_operation_code,e.route_occurrence_key,e.route_position,e.state,
+             e.actual_start::text,e.actual_end::text,e.good_qty,e.reject_qty
+      FROM erp_job_operation_execution e
+      LEFT JOIN planning_batches b ON b.id=e.batch_id
+      WHERE e.job_num=ANY($1::text[]) AND e.state<>'CANCELLED'
+      ORDER BY e.job_num,e.route_position NULLS LAST,e.updated_at`, [jobNums]);
+    for (const raw of executions.rows as Record<string,unknown>[]) {
+      const jobNum=text(raw.job_num); if(!jobNum) continue; const list=executionsByJob.get(jobNum)??[];
+      list.push({jobNum,batchId:raw.batch_id==null?null:String(raw.batch_id),batchNo:raw.batch_no==null?null:String(raw.batch_no),mainOperationCode:text(raw.main_operation_code),routeOccurrenceKey:text(raw.route_occurrence_key),routePosition:numberOrNull(raw.route_position),state:text(raw.state),actualStart:raw.actual_start==null?null:String(raw.actual_start),actualEnd:raw.actual_end==null?null:String(raw.actual_end),goodQty:numberOrNull(raw.good_qty),rejectQty:numberOrNull(raw.reject_qty)}); executionsByJob.set(jobNum,list);
+    }
+    const inspections = await query(`
+      SELECT job_num,route_occurrence_key,route_position,operation_code,inspection_type,status,actual_start::text,actual_end::text,result_code,version
+      FROM erp_inspection_events
+      WHERE job_num=ANY($1::text[])
+      ORDER BY job_num,route_position NULLS LAST,updated_at`, [jobNums]);
+    for (const raw of inspections.rows as Record<string,unknown>[]) {
+      const jobNum=text(raw.job_num); if(!jobNum) continue; const list=inspectionsByJob.get(jobNum)??[];
+      list.push({jobNum,routeOccurrenceKey:text(raw.route_occurrence_key),routePosition:numberOrNull(raw.route_position),operationCode:text(raw.operation_code),inspectionType:text(raw.inspection_type),status:text(raw.status),actualStart:raw.actual_start==null?null:String(raw.actual_start),actualEnd:raw.actual_end==null?null:String(raw.actual_end),resultCode:raw.result_code==null?null:String(raw.result_code),version:Number(raw.version||1)}); inspectionsByJob.set(jobNum,list);
+    }
+  }
+
   return {
     rows,
     operationsByRouteId,
     batchesByJob,
+    executionsByJob,
+    inspectionsByJob,
     warnings,
     duplicateJobNums,
   };

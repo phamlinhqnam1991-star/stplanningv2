@@ -6,6 +6,7 @@ import { getPlanningModel, type MainOperationDefinition, type PlanningModel } fr
 import { calculateStOutputTarget, type StOutputJobAssessment, type StOutputStep } from "@/lib/st-output-engine";
 import { getRecipeModel, type RecipeModel } from "@/lib/recipe-model";
 import { applyCapacityScenario, type CapacityScenarioOverride } from "@/lib/capacity-scenario";
+import { buildCapacityOutputLedger, summarizeOutputLedger, type CanonicalOutputLedgerLine, type CanonicalOutputLedgerSummary } from "@/lib/output-ledger";
 
 export type FiniteCapacityOptions = {
   targetDate: string;
@@ -124,6 +125,11 @@ export type ProposedCapacityBatch = {
 export type CapacityJobResult = {
   jobNum: string;
   planningJobId: number;
+  outputKey: string;
+  finalGateCode: string | null;
+  finalGateOccurrence: number | null;
+  existingScheduledCount: number;
+  existingUnscheduledCount: number;
   sourceStatus: string;
   surfaceDm2: number;
   finishAt: string | null;
@@ -362,6 +368,8 @@ export type FiniteCapacityResult = {
   bottlenecks: CapacityBottleneck[];
   recoveryOptions: CapacityRecoveryOption[];
   backwardPlan: CapacityBackwardTargetPlan;
+  outputLedger: CanonicalOutputLedgerLine[];
+  ledgerSummary: CanonicalOutputLedgerSummary;
   warnings: string[];
 };
 
@@ -1044,7 +1052,7 @@ function evaluateJobs(chains:JobChain[],nodes:BatchNode[],memberNode:Map<string,
   for(const chain of chains){let cursor=scenarioStart;let unscheduled=false;let conflict=false;let reason=chain.blockedReason;for(const m of chain.members){cursor+=m.lagBeforeMinutes*60_000;const id=memberNode.get(m.key);const node=id?nodeMap.get(id):null;if(!node||node.start==null||node.end==null){unscheduled=true;reason=reason||node?.reason||"CAPACITY_BATCH_NOT_SCHEDULED";break;}if(node.start<cursor){conflict=true;reason=reason||"PRECEDENCE_CONFLICT";}cursor=Math.max(cursor,node.end);}if(!unscheduled)cursor+=chain.tailLagMinutes*60_000;
     let finiteStatus:CapacityJobResult["finiteStatus"]="ON_TIME";if(chain.blockedReason||unscheduled)finiteStatus="UNSCHEDULED";else if(conflict)finiteStatus="REVIEW";else if(cursor>cutoff)finiteStatus="LATE";else if(chain.capacityReview)finiteStatus="REVIEW";
     const contributes=!unscheduled&&!conflict&&cursor<=cutoff;
-    out.push({jobNum:chain.row.jobNum,planningJobId:chain.row.planningJobId,sourceStatus:chain.row.outputStatus,surfaceDm2:chain.row.surfaceDm2,finishAt:unscheduled?null:wallIso(cursor),cutoffAt:wallIso(cutoff)!,finiteStatus,contributes,capacityReview:chain.capacityReview,reason});
+    out.push({jobNum:chain.row.jobNum,planningJobId:chain.row.planningJobId,outputKey:chain.row.outputKey,finalGateCode:chain.row.finalGateCode,finalGateOccurrence:chain.row.finalGateOccurrence,existingScheduledCount:chain.row.existingScheduledCount,existingUnscheduledCount:chain.row.existingUnscheduledCount,sourceStatus:chain.row.outputStatus,surfaceDm2:chain.row.surfaceDm2,finishAt:unscheduled?null:wallIso(cursor),cutoffAt:wallIso(cutoff)!,finiteStatus,contributes,capacityReview:chain.capacityReview,reason});
   }
   return out;
 }
@@ -1427,10 +1435,12 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
   if(remainingGap>0)warnings.push(`FINITE_CAPACITY_GAP:${Math.round(remainingGap)}`);
   const processTimeForecast=base.summary.actualSurface+base.summary.committedSurface+sumSurface(plannedRows)+sim.selectedCandidateSurface;
   const bestRecoverySurfaceDm2=recoveryOptions.reduce((m,x)=>Math.max(m,x.recoveredSurfaceDm2),0);
+  const outputLedger=buildCapacityOutputLedger(sim.jobs,base.endpointOperation);
+  const ledgerSummary=summarizeOutputLedger(outputLedger);
   return{
     targetDate:options.targetDate,cutoffTime:options.cutoffTime,cutoffAt:wallIso(cutoff)!,targetValue:options.targetValue,scenarioStartAt:wallIso(scenarioStart)!,horizonEndAt:wallIso(horizonEnd)!,endpointOperation:base.endpointOperation,targetFeasibility,
     summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,baselineFiniteCapacityForecastSurface:baselineFiniteForecast,splitRecoveredSurface,dependencyEdgeCount:sim.dependencies.length,splitBatchCount,splitSourceBatchCount,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length,criticalJobCount:criticalPaths.length,bottleneckCount:bottlenecks.length,recoveryOptionCount:recoveryOptions.length,bestRecoverySurfaceDm2,backwardRequiredSurfaceDm2:backwardPlan.requiredAdditionalSurfaceDm2,backwardPortfolioSurfaceDm2:backwardPlan.selectedPortfolioSurfaceDm2,backwardBatchCount:backwardPlan.batchCount,backwardAreaCount:backwardPlan.areaCount,backwardAtRiskBatchCount:backwardPlan.atRiskBatchCount},
-    selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,dependencies:sim.dependencies,criticalPaths,bottlenecks,recoveryOptions,backwardPlan,warnings,
+    selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,dependencies:sim.dependencies,criticalPaths,bottlenecks,recoveryOptions,backwardPlan,outputLedger,ledgerSummary,warnings,
   };
 }
 

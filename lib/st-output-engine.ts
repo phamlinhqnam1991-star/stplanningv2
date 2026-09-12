@@ -4,9 +4,19 @@ import { getRecipeModel, resolveProcessTime, resolveRecipe, type ProcessTimeSugg
 import { type RouteOperationForAnalysis } from "@/lib/route-analysis";
 import { resolveErpState } from "@/lib/erp-state-kernel";
 import { getStOutputModel, type StOutputModel } from "@/lib/st-output-model";
+import { buildStOutputLedger, summarizeOutputLedger, type CanonicalOutputLedgerLine, type CanonicalOutputLedgerSummary } from "@/lib/output-ledger";
+import {
+  getPredictiveEtaModel,
+  predictiveInspectionKey,
+  suggestPredictiveEta,
+  type EtaConfidence,
+  type PredictiveEtaModel,
+} from "@/lib/predictive-eta";
 import {
   loadStOutputTargetData,
   type StOutputBatchAssignment,
+  type StOutputExecutionActual,
+  type StOutputInspectionActual,
 } from "@/lib/st-output-target-data";
 
 type JsonMap = Record<string, unknown>;
@@ -16,6 +26,7 @@ type BatchAssignment = StOutputBatchAssignment;
 
 export type StOutputStep = {
   routePosition: number;
+  routeOccurrenceKey: string;
   stepType: "PLANNING" | "INTERMEDIATE_INSPECTION" | "PHYSICAL_SUPPORT";
   operationCode: string;
   operationSequence: number | null;
@@ -23,7 +34,12 @@ export type StOutputStep = {
   recipe: RecipeSuggestion;
   processTime: ProcessTimeSuggestion;
   durationMinutes: number | null;
-  durationBasis: "BATCH" | "PROCESS_TIME_RULE" | "UNKNOWN_ZERO" | "UNKNOWN_BLOCK";
+  durationBasis: "BATCH" | "PROCESS_TIME_RULE" | "PREDICTIVE_BLEND" | "PREDICTIVE_P50" | "UNKNOWN_ZERO" | "UNKNOWN_BLOCK";
+  predictiveP50Minutes: number | null;
+  predictiveP80Minutes: number | null;
+  predictiveSampleCount: number;
+  etaConfidence: EtaConfidence;
+  etaBasis: string;
   state: "READY_UNPLANNED" | "WAIT_PREVIOUS" | "BATCHED" | "SCHEDULED" | "RUNNING" | "COMPLETE";
   batchNo: string | null;
   batchStatus: string | null;
@@ -37,6 +53,10 @@ export type StOutputStep = {
   slackMinutes: number | null;
   planned: boolean;
   scheduled: boolean;
+  actualState: string | null;
+  actualStart: string | null;
+  actualEnd: string | null;
+  inspectionActualStatus: string | null;
   needsReview: boolean;
   warnings: string[];
 };
@@ -79,6 +99,10 @@ export type StOutputJobAssessment = {
   nextInspectionFinishAt: string | null;
   routeSnapshotAt: string | null;
   projectedFinsstAt: string | null;
+  projectedP80At: string | null;
+  etaConfidence: EtaConfidence;
+  etaRiskStatus: "NORMAL" | "P80_AFTER_CUTOFF" | "INSUFFICIENT_HISTORY";
+  predictiveSampleCount: number;
   latestRequiredStart: string | null;
   outputStatus: "OUTPUT" | "COMMITTED" | "PLANNED" | "NEED_PLAN" | "AT_RISK" | "REVIEW" | "OUTPUT_OTHER_DAY" | "NOT_APPLICABLE";
   outputBasis: string;
@@ -86,6 +110,8 @@ export type StOutputJobAssessment = {
   needsReview: boolean;
   criticalAction: StOutputStep | null;
   steps: StOutputStep[];
+  actualExecutionCount: number;
+  inspectionFailedCount: number;
   warnings: string[];
 };
 
@@ -140,6 +166,8 @@ export type StOutputTargetResult = {
   rows: StOutputJobAssessment[];
   recommendedJobNums: string[];
   actionGroups: StOutputActionGroup[];
+  outputLedger: CanonicalOutputLedgerLine[];
+  ledgerSummary: CanonicalOutputLedgerSummary;
   warnings: string[];
 };
 
@@ -329,12 +357,24 @@ function evaluateActual(
   return { status:null, basis:"", projected:null, review:false, counts:false };
 }
 
+function occurrenceKeyForPosition(ops: RouteOperationForAnalysis[], position: number): string {
+  const index=ops.findIndex((op)=>op.position===position);
+  if(index<0)return `POS#${position}`;
+  const code=key(ops[index].code); let occurrence=0;
+  for(let i=0;i<=index;i+=1)if(key(ops[i].code)===code)occurrence+=1;
+  return `${ops[index].code}#${occurrence}`;
+}
+function actualWall(value:string|null|undefined,offsetMinutes:number){return wallFromTimestamp(value,offsetMinutes);}
+
 function assessJob(
   row: Record<string, unknown>,
   operations: RouteOperationForAnalysis[],
   assignments: BatchAssignment[],
+  executions: StOutputExecutionActual[],
+  inspections: StOutputInspectionActual[],
   planningModel: PlanningModel,
   recipeModel: RecipeModel,
+  predictiveModel: PredictiveEtaModel,
   outputModel: StOutputModel,
   targetDate: string,
   cutoffTime: string,
@@ -386,6 +426,9 @@ function assessJob(
     remainingInspectionCount:0, nextInspectionCode:null, nextInspectionStatus:null,
     nextInspectionEta:null, nextInspectionFinishAt:null,
     routeSnapshotAt:row.route_snapshot_at as string|null,
+    projectedP80At:null, etaConfidence:"NONE" as EtaConfidence, etaRiskStatus:"INSUFFICIENT_HISTORY" as const, predictiveSampleCount:0,
+    actualExecutionCount:executions.length,
+    inspectionFailedCount:inspections.filter((x)=>key(x.status)==="FAILED").length,
   };
   if (!endpoint) {
     return { ...base, remainingOperationCount:0, remainingProcessMinutes:null, projectedFinsstAt:null, latestRequiredStart:null,
@@ -393,12 +436,24 @@ function assessJob(
       needsReview:false, criticalAction:null, steps:[], warnings:["ENDPOINT_NOT_IN_ROUTE"] };
   }
 
+  const finalOccurrenceKey=occurrenceKeyForPosition(sorted,endpoint.position);
+  const finalInspection=inspections.find((x)=>x.routeOccurrenceKey===finalOccurrenceKey || (x.routePosition===endpoint.position && key(x.operationCode)===key(endpoint.code))) || null;
+  if(finalInspection && key(finalInspection.status)==="FAILED") {
+    return { ...base, outputBucket:"BLOCKED",remainingOperationCount:Math.max(0,endpointIndex-currentIndex),remainingProcessMinutes:null,projectedFinsstAt:null,latestRequiredStart:null,outputStatus:"REVIEW",outputBasis:`Final Inspection ${endpoint.code} FAILED`,countsTowardTarget:false,needsReview:true,criticalAction:null,steps:[],warnings:["FINAL_INSPECTION_FAILED"] };
+  }
+  if(finalInspection && ["PASSED","SKIPPED"].includes(key(finalInspection.status)) && finalInspection.actualEnd) {
+    const finalWall=actualWall(finalInspection.actualEnd,outputModel.timezoneOffsetMinutes);
+    const onTime=finalWall!=null&&finalWall<=cutoffWall&&wallDate(finalWall)===targetDate;
+    const status:StOutputJobAssessment["outputStatus"]=onTime?"OUTPUT":"AT_RISK";
+    return { ...base,outputBucket:onTime?"ALREADY_REACHED_FINAL":"LATE",remainingOperationCount:0,remainingProcessMinutes:0,projectedFinsstAt:wallIso(finalWall),projectedP80At:wallIso(finalWall),etaConfidence:"HIGH",etaRiskStatus:"NORMAL",predictiveSampleCount:0,latestRequiredStart:wallIso(finalWall),outputStatus:status,outputBasis:`Actual Final Inspection ${endpoint.code} ${finalInspection.status}`,countsTowardTarget:onTime,needsReview:false,criticalAction:null,steps:[],warnings:[] };
+  }
   const actual = evaluateActual(endpoint,currentIndex,endpointIndex,snapshotWall,targetDate,cutoffWall,outputModel);
   if (actual.status) {
     const actualWarnings = actual.review ? ["OUTPUT_TIME_REVIEW"] : [];
     return { ...base, outputBucket:outputBucketFor(actual.status,actualWarnings),
       remainingOperationCount:Math.max(0,endpointIndex-currentIndex), remainingProcessMinutes:0,
-      projectedFinsstAt:actual.projected, latestRequiredStart:actual.projected, outputStatus:actual.status, outputBasis:actual.basis,
+      projectedFinsstAt:actual.projected, projectedP80At:actual.projected, etaConfidence:actual.review?"NONE":"HIGH", etaRiskStatus:actual.review?"INSUFFICIENT_HISTORY":"NORMAL", predictiveSampleCount:0,
+      latestRequiredStart:actual.projected, outputStatus:actual.status, outputBasis:actual.basis,
       countsTowardTarget:actual.counts, needsReview:actual.review, criticalAction:null, steps:[], warnings:actualWarnings };
   }
   if (currentIndex < 0 || endpointIndex < currentIndex) {
@@ -411,10 +466,14 @@ function assessJob(
   const queues = batchQueues(assignments);
   const steps: StOutputStep[] = [];
   let cursor = snapshotWall ?? Date.now() + outputModel.timezoneOffsetMinutes*60_000;
+  let p80Cursor = cursor;
   let unknownBlocked = false;
 
   for (let i=0;i<requiredOps.length;i++) {
     const op = requiredOps[i];
+    const occurrenceKey=occurrenceKeyForPosition(sorted,op.position);
+    const execution=executions.find((x)=>x.routeOccurrenceKey===occurrenceKey || (x.routePosition===op.position && key(x.mainOperationCode)===key(mapMain(op.code,planningModel)?.code))) || null;
+    const inspectionActual=inspections.find((x)=>x.routeOccurrenceKey===occurrenceKey || (x.routePosition===op.position && key(x.operationCode)===key(op.code))) || null;
     const main = mapMain(op.code, planningModel);
     const include = outputModel.includeNonPlanningOperations || Boolean(main?.planningEnabled);
     if (!include) continue;
@@ -426,34 +485,91 @@ function assessJob(
     });
     const batch = takeBatch(main, op.code, op.position, queues);
     const batchMinutes = batch?.processTimeMinutes;
-    let duration = batchMinutes != null ? batchMinutes : process.minutes;
-    let basis: StOutputStep["durationBasis"] = batchMinutes != null ? "BATCH" : process.minutes != null ? "PROCESS_TIME_RULE" : outputModel.unknownStepPolicy === "BLOCK" ? "UNKNOWN_BLOCK" : "UNKNOWN_ZERO";
+    const configuredDuration = batchMinutes != null ? batchMinutes : process.minutes;
+    const type = stepTypeOf(main);
+    const predictiveKey = type === "INTERMEDIATE_INSPECTION"
+      ? predictiveInspectionKey(op.code)
+      : main?.code || null;
+    const eta = suggestPredictiveEta(
+      predictiveModel,
+      predictiveKey,
+      type === "INTERMEDIATE_INSPECTION" ? null : recipe.recipeNo,
+      configuredDuration,
+    );
+    let duration = eta.forecastMinutes;
+    let basis: StOutputStep["durationBasis"] = batchMinutes != null
+      ? (eta.confidence !== "NONE" ? "PREDICTIVE_BLEND" : "BATCH")
+      : process.minutes != null
+        ? (eta.confidence !== "NONE" ? "PREDICTIVE_BLEND" : "PROCESS_TIME_RULE")
+        : eta.confidence !== "NONE" && eta.forecastMinutes != null
+          ? "PREDICTIVE_P50"
+          : outputModel.unknownStepPolicy === "BLOCK"
+            ? "UNKNOWN_BLOCK"
+            : "UNKNOWN_ZERO";
     const stepWarnings: string[] = [];
     let review = Boolean(recipe.needsReview || process.needsReview);
+    if (eta.confidence === "NONE" && predictiveModel.enabled && configuredDuration != null) {
+      stepWarnings.push("PREDICTIVE_HISTORY_INSUFFICIENT");
+    }
     if (duration == null) {
       if (outputModel.unknownStepPolicy === "BLOCK") { unknownBlocked = true; review = true; stepWarnings.push("PROCESS_TIME_MISSING"); }
       else { duration = outputModel.defaultUnknownMinutes; review = true; stepWarnings.push("PROCESS_TIME_MISSING_USING_CONFIGURED_FALLBACK"); }
     }
     const schedule = batch ? scheduleWall(batch) : {start:null,end:null};
-    const planned = Boolean(batch);
-    const scheduled = schedule.start != null && schedule.end != null;
+    const actualState=execution?.state || null;
+    const inspectionState=inspectionActual?.status || null;
+    const planned = Boolean(batch) || Boolean(execution);
+    const scheduled = (schedule.start != null && schedule.end != null) || Boolean(execution?.actualStart);
     let start = cursor;
     let finish: number | null = duration == null ? null : start + duration*60_000;
+    const p80Duration = eta.confidence !== "NONE" ? (eta.p80Minutes ?? duration) : duration;
+    let p80Start = p80Cursor;
+    let p80Finish: number | null = p80Duration == null ? null : p80Start + p80Duration*60_000;
     if (scheduled && schedule.start != null && schedule.end != null) {
       if (schedule.start >= cursor) { start=schedule.start; finish=schedule.end; }
       else if (schedule.end >= cursor) { start=schedule.start; finish=schedule.end; }
       else { stepWarnings.push("SCHEDULE_BEFORE_ROUTE_READY"); review=true; }
+      // An accepted exact reservation is stronger evidence than statistical duration.
+      p80Start = schedule.start;
+      p80Finish = Math.max(schedule.end, p80Cursor);
     }
-    if (finish != null) cursor=finish;
-    const state: StOutputStep["state"] = scheduled
-      ? (key(batch?.status)==="STARTED"?"RUNNING":"SCHEDULED")
+    if(execution?.actualStart){
+      const a=actualWall(execution.actualStart,outputModel.timezoneOffsetMinutes);
+      if(a!=null){start=a;p80Start=a;}
+    }
+    if(key(execution?.state)==="DONE"){
+      const a=actualWall(execution?.actualEnd,outputModel.timezoneOffsetMinutes);
+      finish=a??start;p80Finish=finish;duration=0;basis="BATCH";
+    }
+    else if(key(execution?.state)==="IN_PROGRESS"&&duration!=null){
+      finish=start+duration*60_000;
+      p80Finish=p80Duration==null?finish:start+p80Duration*60_000;
+    }
+    if(type==="INTERMEDIATE_INSPECTION" && inspectionActual){
+      if(["PASSED","SKIPPED"].includes(key(inspectionActual.status))){
+        const a=actualWall(inspectionActual.actualEnd,outputModel.timezoneOffsetMinutes);
+        finish=a??start;p80Finish=finish;duration=0;basis="BATCH";
+      }
+      else if(key(inspectionActual.status)==="IN_PROGRESS"&&inspectionActual.actualStart){
+        const a=actualWall(inspectionActual.actualStart,outputModel.timezoneOffsetMinutes);
+        if(a!=null){start=a;p80Start=a;finish=duration==null?null:a+duration*60_000;p80Finish=p80Duration==null?finish:a+p80Duration*60_000;}
+      }
+      else if(key(inspectionActual.status)==="FAILED"){unknownBlocked=true;review=true;finish=null;p80Finish=null;stepWarnings.push("INSPECTION_FAILED");}
+    }
+    if (finish != null) cursor=Math.max(cursor,finish);
+    if (p80Finish != null) p80Cursor=Math.max(p80Cursor,p80Finish);
+    const state: StOutputStep["state"] = key(execution?.state)==="DONE" || ["PASSED","SKIPPED"].includes(key(inspectionActual?.status)) ? "COMPLETE"
+      : key(execution?.state)==="IN_PROGRESS" || key(inspectionActual?.status)==="IN_PROGRESS" ? "RUNNING"
+      : scheduled ? (key(batch?.status)==="STARTED"?"RUNNING":"SCHEDULED")
       : planned ? "BATCHED" : i===0 ? "READY_UNPLANNED" : "WAIT_PREVIOUS";
     steps.push({
-      routePosition:op.position, stepType:stepTypeOf(main), operationCode:op.code, operationSequence:op.sequence ?? null, mainOperation:main,
-      recipe, processTime:process, durationMinutes:duration, durationBasis:basis, state,
+      routePosition:op.position, routeOccurrenceKey:occurrenceKey, stepType:stepTypeOf(main), operationCode:op.code, operationSequence:op.sequence ?? null, mainOperation:main,
+      recipe, processTime:process, durationMinutes:duration, durationBasis:basis,
+      predictiveP50Minutes:eta.p50Minutes, predictiveP80Minutes:eta.p80Minutes, predictiveSampleCount:eta.sampleCount,
+      etaConfidence:eta.confidence, etaBasis:eta.basis, state,
       batchNo:batch?.batchNo || null, batchStatus:batch?.status || null, scheduleDate:batch?.scheduleDate || null,
       scheduleStart:wallIso(schedule.start), scheduleEnd:wallIso(schedule.end), earliestStart:wallIso(start), earliestFinish:wallIso(finish),
-      latestStart:null, latestFinish:null, slackMinutes:null, planned, scheduled, needsReview:review, warnings:stepWarnings,
+      latestStart:null, latestFinish:null, slackMinutes:null, planned, scheduled, actualState,actualStart:execution?.actualStart||null,actualEnd:execution?.actualEnd||null,inspectionActualStatus:inspectionState,needsReview:review, warnings:stepWarnings,
     });
   }
 
@@ -470,6 +586,7 @@ function assessJob(
   }
 
   const projected = unknownBlocked ? null : (steps.length ? cursor : snapshotWall);
+  const projectedP80 = unknownBlocked ? null : (steps.length ? p80Cursor : snapshotWall);
   const allPlanningSteps = steps.filter((x)=>x.mainOperation?.planningEnabled);
   const allPlanned = allPlanningSteps.every((x)=>x.planned);
   const allScheduled = allPlanningSteps.every((x)=>x.scheduled);
@@ -484,9 +601,29 @@ function assessJob(
   else if (allScheduled) { status="COMMITTED"; basis="All remaining Planning steps are scheduled and calculated arrival is before cutoff."; }
   else if (allPlanned) { status="PLANNED"; basis="All remaining Planning steps are batched; scheduling is not complete but process-time forecast is before cutoff."; }
   else { status="NEED_PLAN"; basis=`Process-time forecast can reach ${endpoint.code} before cutoff, but one or more remaining Planning steps are not batched.`; }
+  const predictiveSteps = steps.filter((x)=>!x.scheduled && x.state!=="COMPLETE" && x.state!=="RUNNING");
+  const confidenceRank: Record<EtaConfidence,number> = {NONE:0,LOW:1,MEDIUM:2,HIGH:3};
+  const etaConfidence: EtaConfidence = predictiveSteps.length===0
+    ? "HIGH"
+    : predictiveSteps.reduce<EtaConfidence>((lowest,step)=>confidenceRank[step.etaConfidence]<confidenceRank[lowest]?step.etaConfidence:lowest,"HIGH");
+  const predictiveSampleCount = predictiveSteps.reduce((sum,step)=>sum+step.predictiveSampleCount,0);
+  const p80AfterCutoff = predictiveModel.p80RiskAlert && projectedP80!=null && projectedP80>cutoffWall;
+  const etaRiskStatus: StOutputJobAssessment["etaRiskStatus"] = p80AfterCutoff
+    ? "P80_AFTER_CUTOFF"
+    : predictiveSteps.length>0 && etaConfidence==="NONE"
+      ? "INSUFFICIENT_HISTORY"
+      : "NORMAL";
+  if(p80AfterCutoff){
+    warnings.push("P80_AFTER_CUTOFF");
+    if(predictiveModel.p80BlocksForecast && ["COMMITTED","PLANNED","NEED_PLAN"].includes(status)){
+      status="AT_RISK";
+      basis=`P50/primary ETA is feasible, but predictive P80 arrival at ${endpoint.code} is after cutoff.`;
+    }
+  }
   if (anyReview) warnings.push("ONE_OR_MORE_STEPS_NEED_REVIEW");
   if (steps.some((x)=>x.durationBasis === "UNKNOWN_ZERO" || x.durationBasis === "UNKNOWN_BLOCK")) warnings.push("FINAL_TIME_UNKNOWN");
   if (steps.some((x)=>x.warnings.includes("SCHEDULE_BEFORE_ROUTE_READY"))) warnings.push("SCHEDULE_CONFLICT");
+  if (steps.some((x)=>x.warnings.includes("INSPECTION_FAILED"))) warnings.push("INSPECTION_FAILED_BLOCKS_OUTPUT");
   const remainingMinutes = steps.every((x)=>x.durationMinutes!=null) ? steps.reduce((s,x)=>s+(x.durationMinutes||0),0) : null;
   const inspectionSteps = steps.filter((x)=>x.stepType === "INTERMEDIATE_INSPECTION");
   const nextInspection = inspectionSteps[0] || null;
@@ -501,7 +638,8 @@ function assessJob(
     nextInspectionStatus:nextInspection ? inspectionStatusOf(nextInspection) : null,
     nextInspectionEta:nextInspection?.earliestStart || null,
     nextInspectionFinishAt:nextInspection?.earliestFinish || null,
-    projectedFinsstAt:wallIso(projected), latestRequiredStart:steps[0]?.latestStart || wallIso(cutoffWall), outputStatus:status,
+    projectedFinsstAt:wallIso(projected), projectedP80At:wallIso(projectedP80), etaConfidence, etaRiskStatus, predictiveSampleCount,
+    latestRequiredStart:steps[0]?.latestStart || wallIso(cutoffWall), outputStatus:status,
     outputBasis:basis, countsTowardTarget:status==="COMMITTED" || status==="PLANNED", needsReview:anyReview,
     criticalAction:critical, steps, warnings };
 }
@@ -541,10 +679,13 @@ function actionGroups(selected: StOutputJobAssessment[]): StOutputActionGroup[] 
 }
 
 export async function calculateStOutputTarget(options: StOutputTargetOptions): Promise<StOutputTargetResult> {
-  const bootstrap = await getConfigBootstrap();
-  const planningModel = await getPlanningModel();
-  const recipeModel = await getRecipeModel();
-  const outputModel = await getStOutputModel();
+  const [bootstrap, planningModel, recipeModel, outputModel, predictiveModel] = await Promise.all([
+    getConfigBootstrap(),
+    getPlanningModel(),
+    getRecipeModel(),
+    getStOutputModel(),
+    getPredictiveEtaModel(),
+  ]);
   const planningProfile = bootstrap.sources.PLANNING;
   const planningSheetName = planningProfile.sheetName || planningProfile.displayName;
   const maxRows = Math.max(
@@ -563,8 +704,11 @@ export async function calculateStOutputTarget(options: StOutputTargetOptions): P
       row,
       loaded.operationsByRouteId.get(Number(row.route_id)) || [],
       loaded.batchesByJob.get(String(row.job_num || "")) || [],
+      loaded.executionsByJob.get(String(row.job_num || "")) || [],
+      loaded.inspectionsByJob.get(String(row.job_num || "")) || [],
       planningModel,
       recipeModel,
+      predictiveModel,
       outputModel,
       options.targetDate,
       options.cutoffTime,
@@ -597,6 +741,8 @@ export async function calculateStOutputTarget(options: StOutputTargetOptions): P
       : row,
   );
 
+  const outputLedger = buildStOutputLedger(assessed);
+  const ledgerSummary = summarizeOutputLedger(outputLedger);
   const recommendedSurface = selected.reduce((sum, row) => sum + row.surfaceDm2, 0);
   const forecastWithRecommendation = forecastBeforeNewPlan + recommendedSurface;
   const remainingGap = Math.max(0, options.targetValue - forecastWithRecommendation);
@@ -612,14 +758,13 @@ export async function calculateStOutputTarget(options: StOutputTargetOptions): P
     ? Math.max(...snapshotCandidates)
     : null;
 
-  const alreadyReachedFinalSurface = sumBucket("ALREADY_REACHED_FINAL");
-  const existingPlanForecastSurface = sumBucket("EXISTING_PLAN_FORECAST");
-  const proposedAdditionalSurface = recommendedSurface;
-  const totalForecastSurface =
-    alreadyReachedFinalSurface + existingPlanForecastSurface + proposedAdditionalSurface;
-  const lateSurface = sumBucket("LATE");
-  const blockedSurface = sumBucket("BLOCKED");
-  const timeUnknownSurface = sumBucket("TIME_UNKNOWN");
+  const alreadyReachedFinalSurface = ledgerSummary.actualFinalSurfaceDm2;
+  const existingPlanForecastSurface = ledgerSummary.existingScheduledSurfaceDm2 + ledgerSummary.existingUnscheduledSurfaceDm2;
+  const proposedAdditionalSurface = ledgerSummary.proposedSurfaceDm2;
+  const totalForecastSurface = ledgerSummary.countedSurfaceDm2;
+  const lateSurface = ledgerSummary.lateSurfaceDm2;
+  const blockedSurface = ledgerSummary.blockedSurfaceDm2;
+  const timeUnknownSurface = ledgerSummary.timeUnknownSurfaceDm2;
 
   const filtered = options.status?.trim()
     ? assessed.filter((row) => row.outputStatus === options.status)
@@ -667,6 +812,8 @@ export async function calculateStOutputTarget(options: StOutputTargetOptions): P
     rows: filtered,
     recommendedJobNums: [...selectedJobNums],
     actionGroups: actionGroups(selected),
+    outputLedger,
+    ledgerSummary,
     warnings: [...loaded.warnings],
   };
 
@@ -684,6 +831,12 @@ export async function calculateStOutputTarget(options: StOutputTargetOptions): P
   }
   if (assessed.some((row) => row.outputBucket === "BLOCKED")) {
     result.warnings.push("BLOCKED_OUTPUT_ROUTE_EXISTS");
+  }
+  if (assessed.some((row) => row.etaRiskStatus === "P80_AFTER_CUTOFF")) {
+    result.warnings.push("PREDICTIVE_P80_CUTOFF_RISK_EXISTS");
+  }
+  if (predictiveModel.enabled && assessed.some((row) => row.etaRiskStatus === "INSUFFICIENT_HISTORY")) {
+    result.warnings.push("PREDICTIVE_HISTORY_INSUFFICIENT_FOR_SOME_JOBS");
   }
 
   return result;

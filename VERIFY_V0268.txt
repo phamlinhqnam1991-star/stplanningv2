@@ -1,0 +1,12 @@
+ST Planning v026.8 verification checklist
+
+[1] Migrations 42/43/44/45 each contain <= 10 SQL statements.
+[2] lib TypeScript strict semantic compile with project-local verification stubs: PASS.
+[3] All project TS/TSX syntactic transpile check: PASS.
+[4] Canonical OutputKey is preserved into finite-capacity/What-if results.
+[5] OUT-40 actual execution/inspection overrides plan forecast.
+[6] Predictive ETA uses P50/P80 history and does not override exact accepted schedule/actual completion.
+[7] Proposed Plan Accept Selected/All revalidates live route/recipe/commitment/resource state.
+[8] Proposal acceptance uses one PostgreSQL transaction for the accepted scope and no silent reschedule.
+[9] Product metadata updated to v026.8.
+[10] Full npm/next build requires installed dependencies; see final delivery note for actual build result.

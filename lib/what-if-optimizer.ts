@@ -23,6 +23,10 @@ export type WhatIfScenarioSummary = {
   criticalJobCount: number;
   bottleneckCount: number;
   proposedBatchCount: number;
+  countedJobs: number;
+  lateJobs: number;
+  blockedJobs: number;
+  timeUnknownJobs: number;
   deltaForecastVsBaseline: number;
   deltaForecastVsCustom: number;
   recoveredGapVsCustom: number;
@@ -63,7 +67,7 @@ function addMinutes(time:string,minutes:number):string|null{
 function summary(code:string,name:string,kind:WhatIfScenarioSummary["kind"],result:FiniteCapacityResult,snapshot:CapacityScenarioSnapshot,baselineForecast:number,customForecast:number,rationale:string):WhatIfScenarioSummary{
   const forecast=result.summary.finiteCapacityForecastSurface;
   const gap=result.summary.remainingGap;
-  return {code,name,kind,targetDate:result.targetDate,cutoffTime:result.cutoffTime,targetValue:result.targetValue,forecastSurfaceDm2:forecast,gapDm2:gap,achievementPct:result.summary.achievementPct,feasibility:result.targetFeasibility,lateBatchCount:result.summary.lateBatchCount,unscheduledBatchCount:result.summary.unscheduledBatchCount,criticalJobCount:result.summary.criticalJobCount,bottleneckCount:result.summary.bottleneckCount,proposedBatchCount:result.summary.proposedBatchCount,deltaForecastVsBaseline:forecast-baselineForecast,deltaForecastVsCustom:forecast-customForecast,recoveredGapVsCustom:Math.max(0,customForecast<result.targetValue?Math.min(result.targetValue-customForecast,forecast-customForecast):0),snapshot,rationale};
+  return {code,name,kind,targetDate:result.targetDate,cutoffTime:result.cutoffTime,targetValue:result.targetValue,forecastSurfaceDm2:forecast,gapDm2:gap,achievementPct:result.summary.achievementPct,feasibility:result.targetFeasibility,lateBatchCount:result.summary.lateBatchCount,unscheduledBatchCount:result.summary.unscheduledBatchCount,criticalJobCount:result.summary.criticalJobCount,bottleneckCount:result.summary.bottleneckCount,proposedBatchCount:result.summary.proposedBatchCount,countedJobs:result.ledgerSummary.countedJobs,lateJobs:result.ledgerSummary.lateJobs,blockedJobs:result.ledgerSummary.blockedJobs,timeUnknownJobs:result.ledgerSummary.timeUnknownJobs,deltaForecastVsBaseline:forecast-baselineForecast,deltaForecastVsCustom:forecast-customForecast,recoveredGapVsCustom:Math.max(0,customForecast<result.targetValue?Math.min(result.targetValue-customForecast,forecast-customForecast):0),snapshot,rationale};
 }
 
 export async function calculateWhatIfOptimizer(request:WhatIfScenarioRequest):Promise<WhatIfOptimizerResult>{
