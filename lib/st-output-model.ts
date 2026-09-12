@@ -11,6 +11,7 @@ export type StOutputStatusConfig = {
 
 export type StOutputModel = {
   endpointOperationCode: string;
+  finalInspectionOperationCodes: string[];
   defaultCutoffTime: string;
   defaultTargetValue: number;
   metricCode: string;
@@ -42,9 +43,27 @@ function boolValue(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function stringArray(value: unknown, fallback: string[]): string[] {
+  const source = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[;,|]/g)
+      : fallback;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of source) {
+    const code = String(item ?? "").trim().toUpperCase();
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    out.push(code);
+  }
+  return out.length ? out : [...fallback];
+}
+
 export async function getStOutputModel(): Promise<StOutputModel> {
   const defaults: StOutputModel = {
     endpointOperationCode: "FINSST",
+    finalInspectionOperationCodes: ["FINSST", "CFINM-VN"],
     defaultCutoffTime: "15:00",
     defaultTargetValue: 50000,
     metricCode: "SURFACE_DM2",
@@ -84,8 +103,18 @@ export async function getStOutputModel(): Promise<StOutputModel> {
     const unknown = text(settings["stOutput.unknownStepPolicy"], defaults.unknownStepPolicy).toUpperCase();
     const surfaceModeRaw = text(settings["stOutput.surfaceCalculationMode"], defaults.surfaceCalculationMode).toUpperCase();
     const surfaceCalculationMode = surfaceModeRaw === "SURFACE_X_PROD_QTY" || surfaceModeRaw === "SURFACE_X_GOOD_WIP_QTY" ? surfaceModeRaw : "DIRECT";
+    const endpointOperationCode = text(settings["stOutput.endpointOperationCode"], defaults.endpointOperationCode).toUpperCase();
+    const configuredFinalCodes = stringArray(
+      settings["stOutput.finalInspectionOperationCodes"],
+      defaults.finalInspectionOperationCodes,
+    );
+    const finalInspectionOperationCodes = stringArray(
+      [endpointOperationCode, ...configuredFinalCodes],
+      defaults.finalInspectionOperationCodes,
+    );
     return {
-      endpointOperationCode: text(settings["stOutput.endpointOperationCode"], defaults.endpointOperationCode),
+      endpointOperationCode,
+      finalInspectionOperationCodes,
       defaultCutoffTime: text(settings["stOutput.defaultCutoffTime"], defaults.defaultCutoffTime),
       defaultTargetValue: Math.max(0, numberValue(settings["stOutput.defaultTargetValue"], defaults.defaultTargetValue)),
       metricCode: text(settings["stOutput.metricCode"], defaults.metricCode),

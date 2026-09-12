@@ -141,3 +141,12 @@ Do source ZIP mới nhất không có trong phiên hiện tại, checkpoint này
 ## SQL statement limit
 
 Migration `db/40_production_snapshot_proposed_plan_v025.sql` has been consolidated to **7 top-level SQL statements** (maximum allowed: 10). Secondary indexes are grouped in one PostgreSQL `DO $$ ... $$` block. Business logic and schema semantics are unchanged.
+
+
+## v025.4a · ST Output Target — Intermediate Inspection visibility
+
+- OUT-40 now marks `ST_INSPECTION` occurrences explicitly inside the physical route between planning operations.
+- Inspection remains non-planning: no new Batch/Recipe/Planning Chain logic is introduced.
+- Each Job exposes Next Inspection, Inspection Status, Inspection ETA/Finish, remaining inspection count, Final Gate and Final ETA.
+- Inspection process time continues to come from the existing Process Time model; missing time follows the existing ST Output unknown-step policy and is never invented by the UI.
+- Inspection does not add output dm²; target accounting still credits the Job only at the configured Final Gate.

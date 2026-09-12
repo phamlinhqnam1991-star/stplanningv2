@@ -1,30 +1,21 @@
-import { query } from "@/lib/db";
 import { getConfigBootstrap } from "@/lib/config";
 import { getPlanningModel, type MainOperationDefinition, type PlanningModel } from "@/lib/planning-model";
 import { getRecipeModel, resolveProcessTime, resolveRecipe, type ProcessTimeSuggestion, type RecipeModel, type RecipeSuggestion } from "@/lib/recipe-model";
 import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
 import { getStOutputModel, type StOutputModel } from "@/lib/st-output-model";
+import {
+  loadStOutputTargetData,
+  type StOutputBatchAssignment,
+} from "@/lib/st-output-target-data";
 
 type JsonMap = Record<string, unknown>;
 
-type BatchAssignment = {
-  batchNo: string;
-  mainOperationCode: string;
-  status: string;
-  processTimeMinutes: number | null;
-  createdAt: string;
-  scheduleDate: string | null;
-  startTime: string | null;
-  endTime: string | null;
-  scheduleDurationMinutes: number | null;
-  scheduleStatus: string | null;
-  routePosition: number | null;
-  sourceOperation: string | null;
-  nextPlanningOperation: string | null;
-};
+type BatchAssignment = StOutputBatchAssignment;
+
 
 export type StOutputStep = {
   routePosition: number;
+  stepType: "PLANNING" | "INTERMEDIATE_INSPECTION" | "PHYSICAL_SUPPORT";
   operationCode: string;
   operationSequence: number | null;
   mainOperation: MainOperationDefinition | null;
@@ -49,6 +40,15 @@ export type StOutputStep = {
   warnings: string[];
 };
 
+export type StOutputBucket =
+  | "ALREADY_REACHED_FINAL"
+  | "EXISTING_PLAN_FORECAST"
+  | "PROPOSED_ADDITIONAL"
+  | "LATE"
+  | "BLOCKED"
+  | "TIME_UNKNOWN"
+  | "NOT_APPLICABLE";
+
 export type StOutputJobAssessment = {
   planningJobId: number;
   jobNum: string;
@@ -57,12 +57,25 @@ export type StOutputJobAssessment = {
   revision: string | null;
   qty: number | null;
   surfaceDm2: number;
+  outputKey: string;
+  outputBucket: StOutputBucket;
+  finalGateCode: string | null;
+  finalGateOccurrence: number | null;
+  requiresNewPlan: boolean;
+  selectedForTarget: boolean;
+  existingScheduledCount: number;
+  existingUnscheduledCount: number;
   nextOperation: string | null;
   endpointOperation: string;
   currentPosition: number | null;
   endpointPosition: number | null;
   remainingOperationCount: number;
   remainingProcessMinutes: number | null;
+  remainingInspectionCount: number;
+  nextInspectionCode: string | null;
+  nextInspectionStatus: "READY" | "WAITING" | "IN_PROGRESS" | "REVIEW" | null;
+  nextInspectionEta: string | null;
+  nextInspectionFinishAt: string | null;
   routeSnapshotAt: string | null;
   projectedFinsstAt: string | null;
   latestRequiredStart: string | null;
@@ -96,6 +109,7 @@ export type StOutputTargetResult = {
   targetValue: number;
   metricCode: string;
   endpointOperation: string;
+  finalGateCodes: string[];
   routeSnapshotAt: string | null;
   summary: {
     scannedJobs: number;
@@ -113,6 +127,14 @@ export type StOutputTargetResult = {
     forecastWithRecommendation: number;
     remainingGap: number;
     achievementPct: number;
+    alreadyReachedFinalSurface: number;
+    existingPlanForecastSurface: number;
+    proposedAdditionalSurface: number;
+    totalForecastSurface: number;
+    lateSurface: number;
+    blockedSurface: number;
+    timeUnknownSurface: number;
+    duplicateJobsSuppressed: number;
   };
   rows: StOutputJobAssessment[];
   recommendedJobNums: string[];
@@ -161,6 +183,79 @@ function scheduleWall(batch: BatchAssignment): { start: number | null; end: numb
 function mapMain(operationCode: string, model: PlanningModel): MainOperationDefinition | null {
   return model.operationMappings[key(operationCode)]?.mainOperation || null;
 }
+function stepTypeOf(main: MainOperationDefinition | null): StOutputStep["stepType"] {
+  if (key(main?.code) === "ST_INSPECTION") return "INTERMEDIATE_INSPECTION";
+  if (main?.planningEnabled) return "PLANNING";
+  return "PHYSICAL_SUPPORT";
+}
+
+function inspectionStatusOf(step: StOutputStep): StOutputJobAssessment["nextInspectionStatus"] {
+  if (step.state === "RUNNING") return "IN_PROGRESS";
+  if (step.needsReview && step.durationMinutes == null) return "REVIEW";
+  if (step.state === "READY_UNPLANNED") return "READY";
+  return "WAITING";
+}
+
+function routeSignature(operations: RouteOperationForAnalysis[]): string {
+  const input = operations.map((op) => `${op.position}:${key(op.code)}`).join(">");
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36).toUpperCase();
+}
+
+function finalGateOccurrence(
+  operations: RouteOperationForAnalysis[],
+  endpointIndex: number,
+): number | null {
+  const endpoint = operations[endpointIndex];
+  if (!endpoint) return null;
+  const code = key(endpoint.code);
+  let occurrence = 0;
+  for (let i = 0; i <= endpointIndex; i += 1) {
+    if (key(operations[i]?.code) === code) occurrence += 1;
+  }
+  return occurrence || 1;
+}
+
+function resolveApplicableFinalGate(
+  operations: RouteOperationForAnalysis[],
+  currentIndex: number,
+  finalGateCodes: string[],
+): { endpoint: RouteOperationForAnalysis | null; endpointIndex: number } {
+  const finalSet = new Set(finalGateCodes.map(key).filter(Boolean));
+  const indexes = operations
+    .map((op, index) => (finalSet.has(key(op.code)) ? index : -1))
+    .filter((index) => index >= 0);
+  if (!indexes.length) return { endpoint: null, endpointIndex: -1 };
+
+  // Rework/duplicate-safe: use the first terminal gate in the current physical suffix.
+  // Completed earlier gates are intentionally ignored when currentIndex has moved past them.
+  const endpointIndex = currentIndex >= 0
+    ? (indexes.find((index) => index >= currentIndex) ?? -1)
+    : indexes[indexes.length - 1];
+  return {
+    endpoint: endpointIndex >= 0 ? operations[endpointIndex] : null,
+    endpointIndex,
+  };
+}
+
+function outputBucketFor(
+  status: StOutputJobAssessment["outputStatus"],
+  warnings: string[],
+): StOutputBucket {
+  if (status === "OUTPUT") return "ALREADY_REACHED_FINAL";
+  if (status === "COMMITTED" || status === "PLANNED") return "EXISTING_PLAN_FORECAST";
+  if (status === "NEED_PLAN") return "PROPOSED_ADDITIONAL";
+  if (status === "AT_RISK" || status === "OUTPUT_OTHER_DAY") return "LATE";
+  if (status === "NOT_APPLICABLE") return "NOT_APPLICABLE";
+  if (warnings.some((warning) => warning.includes("TIME") || warning.includes("PROCESS_TIME"))) {
+    return "TIME_UNKNOWN";
+  }
+  return "BLOCKED";
+}
 function batchQueues(assignments: BatchAssignment[]): Map<string, BatchAssignment[]> {
   const out = new Map<string, BatchAssignment[]>();
   for (const b of assignments) {
@@ -199,36 +294,36 @@ function evaluateActual(
   const completion = parseCompletion(endpoint.sourceText);
   if (endpoint.complete === true) {
     if (completion.date && completion.date !== targetDate) {
-      return { status:"OUTPUT_OTHER_DAY", basis:`FINSST completed ${completion.date}`, projected:completion.time ? `${completion.date}T${completion.time.slice(0,5)}` : `${completion.date}`, review:false, counts:false };
+      return { status:"OUTPUT_OTHER_DAY", basis:`${endpoint.code} completed ${completion.date}`, projected:completion.time ? `${completion.date}T${completion.time.slice(0,5)}` : `${completion.date}`, review:false, counts:false };
     }
     if (completion.date === targetDate && completion.time) {
       const completedWall = wallDateTime(completion.date, completion.time);
       return completedWall <= cutoffWall
-        ? { status:"OUTPUT", basis:"FINSST completion timestamp", projected:wallIso(completedWall), review:false, counts:true }
-        : { status:"AT_RISK", basis:"FINSST completed after cutoff", projected:wallIso(completedWall), review:false, counts:false };
+        ? { status:"OUTPUT", basis:`${endpoint.code} completion timestamp`, projected:wallIso(completedWall), review:false, counts:true }
+        : { status:"AT_RISK", basis:`${endpoint.code} completed after cutoff`, projected:wallIso(completedWall), review:false, counts:false };
     }
     if (completion.date === targetDate && snapshotWall != null && wallDate(snapshotWall) === targetDate && snapshotWall <= cutoffWall) {
-      return { status:"OUTPUT", basis:"FINSST complete by route snapshot before cutoff", projected:wallIso(snapshotWall), review:false, counts:true };
+      return { status:"OUTPUT", basis:`${endpoint.code} complete by route snapshot before cutoff`, projected:wallIso(snapshotWall), review:false, counts:true };
     }
     if (completion.date === targetDate && model.completedDateAssumeBeforeCutoff) {
-      return { status:"OUTPUT", basis:"FINSST completion date; configured assume-before-cutoff", projected:completion.date, review:true, counts:true };
+      return { status:"OUTPUT", basis:`${endpoint.code} completion date; configured assume-before-cutoff`, projected:completion.date, review:true, counts:true };
     }
     if (completion.date === targetDate) {
-      return { status:"REVIEW", basis:"FINSST completion date has no time; cutoff cannot be proven", projected:completion.date, review:true, counts:false };
+      return { status:"REVIEW", basis:`${endpoint.code} completion date has no time; cutoff cannot be proven`, projected:completion.date, review:true, counts:false };
     }
     if (!completion.date && snapshotWall != null && wallDate(snapshotWall) === targetDate && snapshotWall <= cutoffWall) {
-      return { status:"OUTPUT", basis:"FINSST complete by route snapshot before cutoff", projected:wallIso(snapshotWall), review:true, counts:true };
+      return { status:"OUTPUT", basis:`${endpoint.code} complete by route snapshot before cutoff`, projected:wallIso(snapshotWall), review:true, counts:true };
     }
-    return { status:"REVIEW", basis:"FINSST is complete but completion date/time is unavailable", projected:null, review:true, counts:false };
+    return { status:"REVIEW", basis:`${endpoint.code} is complete but completion date/time is unavailable`, projected:null, review:true, counts:false };
   }
   if (currentIndex === endpointIndex && model.countReadyAtEndpointAsOutput) {
     if (snapshotWall != null && wallDate(snapshotWall) === targetDate && snapshotWall <= cutoffWall) {
-      return { status:"OUTPUT", basis:"NextOperation is FINSST at route snapshot before cutoff", projected:wallIso(snapshotWall), review:false, counts:true };
+      return { status:"OUTPUT", basis:`NextOperation is ${endpoint.code} at route snapshot before cutoff`, projected:wallIso(snapshotWall), review:false, counts:true };
     }
     if (snapshotWall != null && wallDate(snapshotWall) !== targetDate) {
-      return { status:"OUTPUT_OTHER_DAY", basis:`Job was already at FINSST on ${wallDate(snapshotWall)}`, projected:wallIso(snapshotWall), review:false, counts:false };
+      return { status:"OUTPUT_OTHER_DAY", basis:`Job was already at ${endpoint.code} on ${wallDate(snapshotWall)}`, projected:wallIso(snapshotWall), review:false, counts:false };
     }
-    return { status:"REVIEW", basis:"Job is at FINSST but snapshot is after cutoff or unavailable", projected:wallIso(snapshotWall), review:true, counts:false };
+    return { status:"REVIEW", basis:`Job is at ${endpoint.code} but snapshot is after cutoff or unavailable`, projected:wallIso(snapshotWall), review:true, counts:false };
   }
   return { status:null, basis:"", projected:null, review:false, counts:false };
 }
@@ -243,7 +338,6 @@ function assessJob(
   targetDate: string,
   cutoffTime: string,
 ): StOutputJobAssessment {
-  const endpointCode = key(outputModel.endpointOperationCode);
   const snapshotWall = wallFromTimestamp(row.route_snapshot_at as string | null, outputModel.timezoneOffsetMinutes);
   const cutoffWall = wallDateTime(targetDate, cutoffTime);
   const sorted = [...operations].filter((x)=>x.code).sort((a,b)=>a.position-b.position);
@@ -251,9 +345,13 @@ function assessJob(
     preferNextOperation:true, fallbackFirstIncomplete:true, includeCurrentInRemaining:true,
   });
   const currentIndex = route.currentPosition == null ? -1 : sorted.findIndex((x)=>x.position===route.currentPosition);
-  const endpointIndexes = sorted.map((op,i)=>key(op.code)===endpointCode?i:-1).filter((i)=>i>=0);
-  const endpointIndex = currentIndex >= 0 ? (endpointIndexes.find((i)=>i>=currentIndex) ?? endpointIndexes[endpointIndexes.length-1] ?? -1) : (endpointIndexes[endpointIndexes.length-1] ?? -1);
-  const endpoint = endpointIndex >= 0 ? sorted[endpointIndex] : null;
+  const { endpoint, endpointIndex } = resolveApplicableFinalGate(
+    sorted,
+    currentIndex,
+    outputModel.finalInspectionOperationCodes,
+  );
+  const gateOccurrence = endpointIndex >= 0 ? finalGateOccurrence(sorted, endpointIndex) : null;
+  const routeSig = routeSignature(sorted);
   const warnings: string[] = [];
   const sourceSurface = Number(row.surface_dm2 || 0) || 0;
   const prodQty = Number(row.prod_qty || 0) || 0;
@@ -261,28 +359,40 @@ function assessJob(
   const surfaceDm2 = outputModel.surfaceCalculationMode === "SURFACE_X_PROD_QTY" ? sourceSurface * prodQty
     : outputModel.surfaceCalculationMode === "SURFACE_X_GOOD_WIP_QTY" ? sourceSurface * goodWipQty
     : sourceSurface;
+  const jobNum = String(row.job_num || "");
+  const finalGateCode = endpoint?.code || null;
+  const outputKey = `${jobNum}|${routeSig}|${finalGateCode || "NO_FINAL"}#${gateOccurrence || 0}`;
   const base = {
-    planningJobId:Number(row.id), jobNum:String(row.job_num || ""), program:row.program as string|null,
+    planningJobId:Number(row.id), jobNum, program:row.program as string|null,
     part:row.epicor_part as string|null, revision:(row.route_revision_num || row.revision_num || null) as string|null,
-    qty:numberOrNull(row.prod_qty), surfaceDm2, nextOperation:row.next_operation as string|null,
-    endpointOperation:outputModel.endpointOperationCode, currentPosition:route.currentPosition,
-    endpointPosition:endpoint?.position ?? null, routeSnapshotAt:row.route_snapshot_at as string|null,
+    qty:numberOrNull(row.prod_qty), surfaceDm2, outputKey,
+    outputBucket:"NOT_APPLICABLE" as StOutputBucket,
+    finalGateCode, finalGateOccurrence:gateOccurrence, requiresNewPlan:false, selectedForTarget:false,
+    existingScheduledCount:0, existingUnscheduledCount:0,
+    nextOperation:row.next_operation as string|null,
+    endpointOperation:finalGateCode || outputModel.endpointOperationCode, currentPosition:route.currentPosition,
+    endpointPosition:endpoint?.position ?? null,
+    remainingInspectionCount:0, nextInspectionCode:null, nextInspectionStatus:null,
+    nextInspectionEta:null, nextInspectionFinishAt:null,
+    routeSnapshotAt:row.route_snapshot_at as string|null,
   };
   if (!endpoint) {
     return { ...base, remainingOperationCount:0, remainingProcessMinutes:null, projectedFinsstAt:null, latestRequiredStart:null,
-      outputStatus:"NOT_APPLICABLE", outputBasis:`${outputModel.endpointOperationCode} not found in route`, countsTowardTarget:false,
+      outputStatus:"NOT_APPLICABLE", outputBasis:`No applicable Final Gate (${outputModel.finalInspectionOperationCodes.join(", ")}) found in current route suffix`, countsTowardTarget:false,
       needsReview:false, criticalAction:null, steps:[], warnings:["ENDPOINT_NOT_IN_ROUTE"] };
   }
 
   const actual = evaluateActual(endpoint,currentIndex,endpointIndex,snapshotWall,targetDate,cutoffWall,outputModel);
   if (actual.status) {
-    return { ...base, remainingOperationCount:Math.max(0,endpointIndex-currentIndex), remainingProcessMinutes:0,
+    const actualWarnings = actual.review ? ["OUTPUT_TIME_REVIEW"] : [];
+    return { ...base, outputBucket:outputBucketFor(actual.status,actualWarnings),
+      remainingOperationCount:Math.max(0,endpointIndex-currentIndex), remainingProcessMinutes:0,
       projectedFinsstAt:actual.projected, latestRequiredStart:actual.projected, outputStatus:actual.status, outputBasis:actual.basis,
-      countsTowardTarget:actual.counts, needsReview:actual.review, criticalAction:null, steps:[], warnings:actual.review?["OUTPUT_TIME_REVIEW"]:[] };
+      countsTowardTarget:actual.counts, needsReview:actual.review, criticalAction:null, steps:[], warnings:actualWarnings };
   }
   if (currentIndex < 0 || endpointIndex < currentIndex) {
-    return { ...base, remainingOperationCount:0, remainingProcessMinutes:null, projectedFinsstAt:null, latestRequiredStart:null,
-      outputStatus:"REVIEW", outputBasis:"Current route position cannot be resolved before FINSST", countsTowardTarget:false,
+    return { ...base, outputBucket:"BLOCKED", remainingOperationCount:0, remainingProcessMinutes:null, projectedFinsstAt:null, latestRequiredStart:null,
+      outputStatus:"REVIEW", outputBasis:`Current route position cannot be resolved before ${endpoint.code}`, countsTowardTarget:false,
       needsReview:true, criticalAction:null, steps:[], warnings:["ROUTE_POSITION_REVIEW"] };
   }
 
@@ -328,7 +438,7 @@ function assessJob(
       ? (key(batch?.status)==="STARTED"?"RUNNING":"SCHEDULED")
       : planned ? "BATCHED" : i===0 ? "READY_UNPLANNED" : "WAIT_PREVIOUS";
     steps.push({
-      routePosition:op.position, operationCode:op.code, operationSequence:op.sequence ?? null, mainOperation:main,
+      routePosition:op.position, stepType:stepTypeOf(main), operationCode:op.code, operationSequence:op.sequence ?? null, mainOperation:main,
       recipe, processTime:process, durationMinutes:duration, durationBasis:basis, state,
       batchNo:batch?.batchNo || null, batchStatus:batch?.status || null, scheduleDate:batch?.scheduleDate || null,
       scheduleStart:wallIso(schedule.start), scheduleEnd:wallIso(schedule.end), earliestStart:wallIso(start), earliestFinish:wallIso(finish),
@@ -350,8 +460,8 @@ function assessJob(
 
   const projected = unknownBlocked ? null : (steps.length ? cursor : snapshotWall);
   const allPlanningSteps = steps.filter((x)=>x.mainOperation?.planningEnabled);
-  const allPlanned = allPlanningSteps.length > 0 && allPlanningSteps.every((x)=>x.planned);
-  const allScheduled = allPlanningSteps.length > 0 && allPlanningSteps.every((x)=>x.scheduled);
+  const allPlanned = allPlanningSteps.every((x)=>x.planned);
+  const allScheduled = allPlanningSteps.every((x)=>x.scheduled);
   const anyReview = steps.some((x)=>x.needsReview) || unknownBlocked;
   const timeReview = steps.some((x)=>x.durationBasis === "UNKNOWN_ZERO" || x.durationBasis === "UNKNOWN_BLOCK" || x.warnings.includes("SCHEDULE_BEFORE_ROUTE_READY"));
   const critical = steps.find((x)=>x.mainOperation?.planningEnabled && !x.planned) || steps.find((x)=>!x.scheduled) || steps[0] || null;
@@ -359,14 +469,27 @@ function assessJob(
   let basis: string;
   if (unknownBlocked || projected == null) { status="REVIEW"; basis="One or more remaining operations have no usable process time."; }
   else if (timeReview) { status="REVIEW"; basis="A remaining operation uses unknown/fallback process time or has a schedule conflict; cutoff feasibility is not proven."; }
-  else if (projected > cutoffWall) { status="AT_RISK"; basis="Earliest calculated arrival at FINSST is after cutoff."; }
+  else if (projected > cutoffWall) { status="AT_RISK"; basis=`Earliest calculated arrival at ${endpoint.code} is after cutoff.`; }
   else if (allScheduled) { status="COMMITTED"; basis="All remaining Planning steps are scheduled and calculated arrival is before cutoff."; }
   else if (allPlanned) { status="PLANNED"; basis="All remaining Planning steps are batched; scheduling is not complete but process-time forecast is before cutoff."; }
-  else { status="NEED_PLAN"; basis="Process-time forecast can reach FINSST before cutoff, but one or more remaining Planning steps are not batched."; }
+  else { status="NEED_PLAN"; basis=`Process-time forecast can reach ${endpoint.code} before cutoff, but one or more remaining Planning steps are not batched.`; }
   if (anyReview) warnings.push("ONE_OR_MORE_STEPS_NEED_REVIEW");
+  if (steps.some((x)=>x.durationBasis === "UNKNOWN_ZERO" || x.durationBasis === "UNKNOWN_BLOCK")) warnings.push("FINAL_TIME_UNKNOWN");
   if (steps.some((x)=>x.warnings.includes("SCHEDULE_BEFORE_ROUTE_READY"))) warnings.push("SCHEDULE_CONFLICT");
   const remainingMinutes = steps.every((x)=>x.durationMinutes!=null) ? steps.reduce((s,x)=>s+(x.durationMinutes||0),0) : null;
-  return { ...base, remainingOperationCount:requiredOps.length, remainingProcessMinutes:remainingMinutes,
+  const inspectionSteps = steps.filter((x)=>x.stepType === "INTERMEDIATE_INSPECTION");
+  const nextInspection = inspectionSteps[0] || null;
+  const existingScheduledCount = allPlanningSteps.filter((step)=>step.scheduled).length;
+  const existingUnscheduledCount = allPlanningSteps.filter((step)=>step.planned && !step.scheduled).length;
+  const requiresNewPlan = allPlanningSteps.some((step)=>!step.planned);
+  return { ...base, outputBucket:outputBucketFor(status,warnings), requiresNewPlan,
+    existingScheduledCount, existingUnscheduledCount,
+    remainingOperationCount:requiredOps.length, remainingProcessMinutes:remainingMinutes,
+    remainingInspectionCount:inspectionSteps.length,
+    nextInspectionCode:nextInspection?.operationCode || null,
+    nextInspectionStatus:nextInspection ? inspectionStatusOf(nextInspection) : null,
+    nextInspectionEta:nextInspection?.earliestStart || null,
+    nextInspectionFinishAt:nextInspection?.earliestFinish || null,
     projectedFinsstAt:wallIso(projected), latestRequiredStart:steps[0]?.latestStart || wallIso(cutoffWall), outputStatus:status,
     outputBasis:basis, countsTowardTarget:status==="COMMITTED" || status==="PLANNED", needsReview:anyReview,
     criticalAction:critical, steps, warnings };
@@ -407,83 +530,150 @@ function actionGroups(selected: StOutputJobAssessment[]): StOutputActionGroup[] 
 }
 
 export async function calculateStOutputTarget(options: StOutputTargetOptions): Promise<StOutputTargetResult> {
-  const bootstrap=await getConfigBootstrap();
-  const planningModel=await getPlanningModel();
-  const recipeModel=await getRecipeModel();
-  const outputModel=await getStOutputModel();
-  const planningProfile=bootstrap.sources.PLANNING;
-  const planningSheetName=planningProfile.sheetName || planningProfile.displayName;
-  const maxRows=Math.max(100,Math.min(outputModel.maxScanJobs,options.limit||outputModel.maxScanJobs));
-  const params:unknown[]=[planningSheetName];
-  const where:string[]=[];
-  if(options.search?.trim()){params.push(`%${options.search.trim()}%`);where.push(`(p.job_num ILIKE $${params.length} OR p.epicor_part ILIKE $${params.length} OR p.program ILIKE $${params.length})`);}
-  params.push(maxRows);
-  const whereSql=where.length?`WHERE ${where.join(" AND ")}`:"";
-  const baseRows=await query(`
-    SELECT p.id,p.source_row_no,p.program,p.epicor_part,p.job_num,p.next_operation,p.prod_qty,p.current_good_wip_qty,p.surface_dm2,p.all_operation,
-           rr.row_data AS raw_row_data,
-           jr.id AS route_id,jr.next_operation AS route_next_operation,jr.revision_num AS route_revision_num,
-           COALESCE(ri.completed_at,ri.imported_at) AS route_snapshot_at
-    FROM v_active_planning_jobs p
-    LEFT JOIN raw_sheet_rows rr ON rr.import_id=p.import_id AND rr.sheet_name=$1 AND rr.source_row_no=p.source_row_no
-    LEFT JOIN v_active_job_routes jr ON jr.job_num=p.job_num
-    LEFT JOIN route_import_runs ri ON ri.id=jr.import_id
-    ${whereSql}
-    ORDER BY p.source_row_no
-    LIMIT $${params.length}`,[...params]);
-  const rows=baseRows.rows as Record<string,unknown>[];
-  const routeIds=rows.map((r)=>Number(r.route_id)).filter((x)=>Number.isFinite(x));
-  const jobNums=rows.map((r)=>String(r.job_num||"")).filter(Boolean);
-  const opMap=new Map<number,RouteOperationForAnalysis[]>();
-  if(routeIds.length){
-    const ops=await query(`SELECT job_route_id,operation_position,operation_code,operation_seq,is_complete,open_nonconformance,source_operation_text FROM v_active_job_operation_sequence WHERE job_route_id=ANY($1::bigint[]) ORDER BY job_route_id,operation_position`,[routeIds]);
-    for(const x of ops.rows as Record<string,unknown>[]){const id=Number(x.job_route_id);const arr=opMap.get(id)||[];arr.push({position:Number(x.operation_position),code:String(x.operation_code),sequence:numberOrNull(x.operation_seq),complete:x.is_complete==null?null:Boolean(x.is_complete),openNonconformance:x.open_nonconformance as string|null,sourceText:String(x.source_operation_text||"")});opMap.set(id,arr);}
-  }
-  const batchMap=new Map<string,BatchAssignment[]>();
-  if(jobNums.length){
-    const batches=await query(`
-      SELECT j.job_num,b.batch_no,b.main_operation_code,b.status,b.process_time_minutes,b.created_at,
-             NULLIF(j.candidate_snapshot->>'routePosition','')::integer AS route_position,
-             COALESCE(NULLIF(j.candidate_snapshot->>'nextStOperation',''),NULLIF(j.candidate_snapshot->>'nextOperation','')) AS source_operation,
-             NULLIF(j.candidate_snapshot->>'nextPlanningOperation','') AS next_planning_operation,
-             s.schedule_date,s.start_time,s.end_time,s.duration_minutes AS schedule_duration_minutes,s.status AS schedule_status
-      FROM planning_batch_jobs j
-      JOIN planning_batches b ON b.id=j.batch_id
-      LEFT JOIN LATERAL (
-        SELECT x.schedule_date,x.start_time,x.end_time,x.duration_minutes,x.status
-        FROM v_active_schedule_blocks x
-        WHERE x.batch_ref=b.batch_no
-        ORDER BY x.schedule_date DESC,x.source_row_no DESC LIMIT 1
-      ) s ON true
-      WHERE j.job_num=ANY($1::text[]) AND b.status<>'CANCELLED'
-      ORDER BY j.job_num,b.created_at DESC`,[jobNums]);
-    for(const x of batches.rows as Record<string,unknown>[]){const job=String(x.job_num||"");const arr=batchMap.get(job)||[];arr.push({batchNo:String(x.batch_no||""),mainOperationCode:String(x.main_operation_code||""),status:String(x.status||""),processTimeMinutes:numberOrNull(x.process_time_minutes),createdAt:String(x.created_at||""),scheduleDate:x.schedule_date==null?null:String(x.schedule_date).slice(0,10),startTime:x.start_time==null?null:String(x.start_time),endTime:x.end_time==null?null:String(x.end_time),scheduleDurationMinutes:numberOrNull(x.schedule_duration_minutes),scheduleStatus:x.schedule_status==null?null:String(x.schedule_status),routePosition:numberOrNull(x.route_position),sourceOperation:x.source_operation==null?null:String(x.source_operation),nextPlanningOperation:x.next_planning_operation==null?null:String(x.next_planning_operation)});batchMap.set(job,arr);}
-  }
-  const assessed=rows.map((row)=>assessJob(row,opMap.get(Number(row.route_id))||[],batchMap.get(String(row.job_num||""))||[],planningModel,recipeModel,outputModel,options.targetDate,options.cutoffTime));
-  const filtered=options.status?.trim()?assessed.filter((x)=>x.outputStatus===options.status):assessed;
-  const sum=(status:StOutputJobAssessment["outputStatus"])=>assessed.filter((x)=>x.outputStatus===status).reduce((s,x)=>s+x.surfaceDm2,0);
-  const actualSurface=sum("OUTPUT");
-  const committedSurface=sum("COMMITTED");
-  const plannedSurface=sum("PLANNED");
-  const needPlanSurface=sum("NEED_PLAN");
-  const atRiskSurface=sum("AT_RISK");
-  const reviewSurface=sum("REVIEW");
-  const forecastBeforeNewPlan=actualSurface+committedSurface+plannedSurface;
-  const gap=Math.max(0,options.targetValue-forecastBeforeNewPlan);
-  const selected=recommend(assessed,gap,outputModel.recommendationStrategy);
-  const recommendedSurface=selected.reduce((s,x)=>s+x.surfaceDm2,0);
-  const forecastWithRecommendation=forecastBeforeNewPlan+recommendedSurface;
-  const remainingGap=Math.max(0,options.targetValue-forecastWithRecommendation);
-  const snapshotCandidates=rows.map((r)=>wallFromTimestamp(r.route_snapshot_at as string|null,outputModel.timezoneOffsetMinutes)).filter((x):x is number=>x!=null);
-  const latestSnapshot=snapshotCandidates.length?Math.max(...snapshotCandidates):null;
-  const result:StOutputTargetResult={
-    targetDate:options.targetDate,cutoffTime:options.cutoffTime,cutoffAt:wallIso(wallDateTime(options.targetDate,options.cutoffTime))||`${options.targetDate}T${options.cutoffTime}`,
-    targetValue:options.targetValue,metricCode:outputModel.metricCode,endpointOperation:outputModel.endpointOperationCode,routeSnapshotAt:wallIso(latestSnapshot),
-    summary:{scannedJobs:assessed.length,outputJobs:assessed.filter((x)=>x.outputStatus==="OUTPUT").length,actualSurface,committedSurface,plannedSurface,needPlanSurface,atRiskSurface,reviewSurface,alreadyPlannedSurface:committedSurface+plannedSurface,forecastBeforeNewPlan,gapBeforeRecommendation:gap,recommendedSurface,forecastWithRecommendation,remainingGap,achievementPct:options.targetValue>0?Math.min(999,(forecastWithRecommendation/options.targetValue)*100):0},
-    rows:filtered,recommendedJobNums:selected.map((x)=>x.jobNum),actionGroups:actionGroups(selected),warnings:[],
+  const bootstrap = await getConfigBootstrap();
+  const planningModel = await getPlanningModel();
+  const recipeModel = await getRecipeModel();
+  const outputModel = await getStOutputModel();
+  const planningProfile = bootstrap.sources.PLANNING;
+  const planningSheetName = planningProfile.sheetName || planningProfile.displayName;
+  const maxRows = Math.max(
+    100,
+    Math.min(outputModel.maxScanJobs, options.limit || outputModel.maxScanJobs),
+  );
+
+  const loaded = await loadStOutputTargetData({
+    planningSheetName,
+    search: options.search,
+    maxRows,
+  });
+
+  let assessed = loaded.rows.map((row) =>
+    assessJob(
+      row,
+      loaded.operationsByRouteId.get(Number(row.route_id)) || [],
+      loaded.batchesByJob.get(String(row.job_num || "")) || [],
+      planningModel,
+      recipeModel,
+      outputModel,
+      options.targetDate,
+      options.cutoffTime,
+    ),
+  );
+
+  const sumStatus = (status: StOutputJobAssessment["outputStatus"]) =>
+    assessed
+      .filter((row) => row.outputStatus === status)
+      .reduce((sum, row) => sum + row.surfaceDm2, 0);
+  const sumBucket = (bucket: StOutputBucket) =>
+    assessed
+      .filter((row) => row.outputBucket === bucket)
+      .reduce((sum, row) => sum + row.surfaceDm2, 0);
+
+  const actualSurface = sumStatus("OUTPUT");
+  const committedSurface = sumStatus("COMMITTED");
+  const plannedSurface = sumStatus("PLANNED");
+  const needPlanSurface = sumStatus("NEED_PLAN");
+  const atRiskSurface = sumStatus("AT_RISK");
+  const reviewSurface = sumStatus("REVIEW");
+  const forecastBeforeNewPlan = actualSurface + committedSurface + plannedSurface;
+  const gap = Math.max(0, options.targetValue - forecastBeforeNewPlan);
+  const selected = recommend(assessed, gap, outputModel.recommendationStrategy);
+  const selectedJobNums = new Set(selected.map((row) => row.jobNum));
+
+  assessed = assessed.map((row) =>
+    selectedJobNums.has(row.jobNum)
+      ? { ...row, selectedForTarget: true }
+      : row,
+  );
+
+  const recommendedSurface = selected.reduce((sum, row) => sum + row.surfaceDm2, 0);
+  const forecastWithRecommendation = forecastBeforeNewPlan + recommendedSurface;
+  const remainingGap = Math.max(0, options.targetValue - forecastWithRecommendation);
+  const snapshotCandidates = loaded.rows
+    .map((row) =>
+      wallFromTimestamp(
+        row.route_snapshot_at as string | null,
+        outputModel.timezoneOffsetMinutes,
+      ),
+    )
+    .filter((value): value is number => value != null);
+  const latestSnapshot = snapshotCandidates.length
+    ? Math.max(...snapshotCandidates)
+    : null;
+
+  const alreadyReachedFinalSurface = sumBucket("ALREADY_REACHED_FINAL");
+  const existingPlanForecastSurface = sumBucket("EXISTING_PLAN_FORECAST");
+  const proposedAdditionalSurface = recommendedSurface;
+  const totalForecastSurface =
+    alreadyReachedFinalSurface + existingPlanForecastSurface + proposedAdditionalSurface;
+  const lateSurface = sumBucket("LATE");
+  const blockedSurface = sumBucket("BLOCKED");
+  const timeUnknownSurface = sumBucket("TIME_UNKNOWN");
+
+  const filtered = options.status?.trim()
+    ? assessed.filter((row) => row.outputStatus === options.status)
+    : assessed;
+
+  const result: StOutputTargetResult = {
+    targetDate: options.targetDate,
+    cutoffTime: options.cutoffTime,
+    cutoffAt:
+      wallIso(wallDateTime(options.targetDate, options.cutoffTime)) ||
+      `${options.targetDate}T${options.cutoffTime}`,
+    targetValue: options.targetValue,
+    metricCode: outputModel.metricCode,
+    endpointOperation: outputModel.finalInspectionOperationCodes.join(" / "),
+    finalGateCodes: outputModel.finalInspectionOperationCodes,
+    routeSnapshotAt: wallIso(latestSnapshot),
+    summary: {
+      scannedJobs: assessed.length,
+      outputJobs: assessed.filter((row) => row.outputStatus === "OUTPUT").length,
+      actualSurface,
+      committedSurface,
+      plannedSurface,
+      needPlanSurface,
+      atRiskSurface,
+      reviewSurface,
+      alreadyPlannedSurface: committedSurface + plannedSurface,
+      forecastBeforeNewPlan,
+      gapBeforeRecommendation: gap,
+      recommendedSurface,
+      forecastWithRecommendation,
+      remainingGap,
+      achievementPct:
+        options.targetValue > 0
+          ? Math.min(999, (forecastWithRecommendation / options.targetValue) * 100)
+          : 0,
+      alreadyReachedFinalSurface,
+      existingPlanForecastSurface,
+      proposedAdditionalSurface,
+      totalForecastSurface,
+      lateSurface,
+      blockedSurface,
+      timeUnknownSurface,
+      duplicateJobsSuppressed: loaded.duplicateJobNums.length,
+    },
+    rows: filtered,
+    recommendedJobNums: [...selectedJobNums],
+    actionGroups: actionGroups(selected),
+    warnings: [...loaded.warnings],
   };
-  if(assessed.length>=maxRows)result.warnings.push(`SCAN_LIMIT_REACHED:${maxRows}`);
-  if(outputModel.metricCode!=="SURFACE_DM2")result.warnings.push(`METRIC_${outputModel.metricCode}_NOT_IMPLEMENTED_USING_SURFACE_DM2`);
-  if(assessed.some((x)=>x.warnings.includes("ONE_OR_MORE_STEPS_NEED_REVIEW")))result.warnings.push("PROCESS_TIME_OR_RECIPE_REVIEW_EXISTS");
+
+  if (loaded.rows.length >= maxRows) result.warnings.push(`SCAN_LIMIT_REACHED:${maxRows}`);
+  if (outputModel.metricCode !== "SURFACE_DM2") {
+    result.warnings.push(
+      `METRIC_${outputModel.metricCode}_NOT_IMPLEMENTED_USING_SURFACE_DM2`,
+    );
+  }
+  if (assessed.some((row) => row.warnings.includes("ONE_OR_MORE_STEPS_NEED_REVIEW"))) {
+    result.warnings.push("PROCESS_TIME_OR_RECIPE_REVIEW_EXISTS");
+  }
+  if (assessed.some((row) => row.outputBucket === "TIME_UNKNOWN")) {
+    result.warnings.push("FINAL_TIME_UNKNOWN_EXISTS");
+  }
+  if (assessed.some((row) => row.outputBucket === "BLOCKED")) {
+    result.warnings.push("BLOCKED_OUTPUT_ROUTE_EXISTS");
+  }
+
   return result;
 }
