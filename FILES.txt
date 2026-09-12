@@ -1,0 +1,14 @@
+./CHECKPOINT_SCOPE.txt
+./FILES.txt
+./README_V0254_CHECKPOINT.md
+./VERIFY.txt
+./db/40_production_snapshot_proposed_plan_v025.sql
+./src/components/st-output/combined-production-timeline.tsx
+./src/lib/st-output-v025/combined-timeline.ts
+./src/lib/st-output-v025/final-gate-resolver.ts
+./src/lib/st-output-v025/index.ts
+./src/lib/st-output-v025/output-ledger.ts
+./src/lib/st-output-v025/production-state-snapshot.ts
+./src/lib/st-output-v025/proposal-persistence.ts
+./src/lib/st-output-v025/types.ts
+./src/lib/st-output-v025/what-if-forecast.ts

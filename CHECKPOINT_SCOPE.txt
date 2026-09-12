@@ -1,0 +1,16 @@
+ST Planning v025.4 checkpoint
+
+CHỐT ĐẾN:
+- Production State Snapshot
+- Final Inspection / unfinished Job detection
+- Remaining Route Resolver
+- Existing capacity reservation
+- Output Ledger / unique dm2 forecast
+- Combined Timeline OUT-44 / OUT-45
+- Proposed Plan persistence schema
+
+CHƯA LÀM TIẾP:
+- Accept/Revalidate transaction
+- Conflict handling khi ghi real Batch/Schedule
+
+Nguyên tắc: chỉ sửa nơi cần sửa, không thay đổi READY/WAIT, Planning Chain, Recipe, Batch/Schedule hiện hữu.

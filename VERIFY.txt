@@ -1,0 +1,24 @@
+Verification performed in checkpoint workspace:
+
+1. TypeScript strict compile: PASS
+   - types.ts
+   - final-gate-resolver.ts
+   - production-state-snapshot.ts
+   - output-ledger.ts
+   - what-if-forecast.ts
+   - combined-timeline.ts
+
+2. Syntax/type check with adapter declarations: PASS
+   - proposal-persistence.ts
+   - combined-production-timeline.tsx
+
+3. Resolver smoke test: PASS
+   Route BSAUNSLD -> PRIMER -> TOPCOAT -> FINSST
+   Last=PRIMER / Next=TOPCOAT
+   Result: BEFORE_FINAL / CONTINUE / Remaining TOPCOAT
+
+Important:
+- This verifies the checkpoint modules themselves.
+- Full project build was NOT run because the latest full source ZIP is not present in this session.
+
+SQL LIMIT CHECK: PASS — db/40_production_snapshot_proposed_plan_v025.sql uses 7 top-level statements (<=10).
