@@ -18,6 +18,24 @@ export type CapacityResourceDefinition = {
   data: JsonMap;
 };
 
+export type ChemicalLineCapacityModel = {
+  enabled: boolean;
+  resourceCode: string;
+  processMaxConcurrent: number;
+  ndtRecipeNos: string[];
+  ndtMinutes: number;
+  ndtStartSpacingMinutes: number;
+  loadingDefaultMinutes: number;
+  loadingHeavyMinutes: number;
+  loadingQtyThreshold: number;
+  loadingSurfaceThresholdDm2: number;
+  unloadingDefaultMinutes: number;
+  unloadingHeavyMinutes: number;
+  unloadingQtyThreshold: number;
+  unloadingSurfaceThresholdDm2: number;
+  existingSchedulePolicy: "CONSERVATIVE_PROCESS_BLOCK" | "PHYSICAL_ONLY";
+};
+
 export type CapacityModel = {
   resources: Record<string, CapacityResourceDefinition>;
   resourceList: CapacityResourceDefinition[];
@@ -31,6 +49,7 @@ export type CapacityModel = {
   proposedBatchPrefix: string;
   unmappedResourcePolicy: "BLOCK" | "REVIEW_UNCONSTRAINED";
   groupBySourceOperation: boolean;
+  chemicalLine: ChemicalLineCapacityModel;
 };
 
 function record(value: unknown): JsonMap {
@@ -48,6 +67,9 @@ function bool(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 function key(value: unknown): string { return value == null ? "" : String(value).trim().toUpperCase(); }
+function stringArray(value: unknown, fallback: string[]): string[] {
+  return Array.isArray(value) ? value.map((x) => String(x).trim()).filter(Boolean) : fallback;
+}
 
 export async function getCapacityModel(): Promise<CapacityModel> {
   const defaults: CapacityModel = {
@@ -55,6 +77,12 @@ export async function getCapacityModel(): Promise<CapacityModel> {
     spillHours: 24, candidateSurfaceMultiplier: 1.5, maxCandidateJobs: 250,
     includeExistingSchedule: true, proposedBatchPrefix: "PROP",
     unmappedResourcePolicy: "REVIEW_UNCONSTRAINED", groupBySourceOperation: true,
+    chemicalLine: {
+      enabled: true, resourceCode: "FLYBAR", processMaxConcurrent: 3, ndtRecipeNos: ["001","009","016","025"],
+      ndtMinutes: 300, ndtStartSpacingMinutes: 90, loadingDefaultMinutes: 30, loadingHeavyMinutes: 45,
+      loadingQtyThreshold: 501, loadingSurfaceThresholdDm2: 5001, unloadingDefaultMinutes: 30, unloadingHeavyMinutes: 45,
+      unloadingQtyThreshold: 501, unloadingSurfaceThresholdDm2: 5001, existingSchedulePolicy: "CONSERVATIVE_PROCESS_BLOCK",
+    },
   };
   try {
     const result = await query(`
@@ -99,6 +127,23 @@ export async function getCapacityModel(): Promise<CapacityModel> {
       proposedBatchPrefix: text(settings["capacity.proposedBatchPrefix"], defaults.proposedBatchPrefix),
       unmappedResourcePolicy: key(settings["capacity.unmappedResourcePolicy"]) === "BLOCK" ? "BLOCK" : "REVIEW_UNCONSTRAINED",
       groupBySourceOperation: bool(settings["capacity.groupBySourceOperation"], defaults.groupBySourceOperation),
+      chemicalLine: {
+        enabled: bool(settings["capacity.chemicalLineSegmented"], defaults.chemicalLine.enabled),
+        resourceCode: text(settings["capacity.chemicalLineResourceCode"], defaults.chemicalLine.resourceCode),
+        processMaxConcurrent: Math.max(1, Math.min(16, Math.trunc(num(settings["capacity.chemicalLineProcessMaxConcurrent"], defaults.chemicalLine.processMaxConcurrent)))),
+        ndtRecipeNos: stringArray(settings["capacity.chemicalLineNdtRecipeNos"], defaults.chemicalLine.ndtRecipeNos),
+        ndtMinutes: Math.max(0, num(settings["capacity.chemicalLineNdtMinutes"], defaults.chemicalLine.ndtMinutes)),
+        ndtStartSpacingMinutes: Math.max(0, num(settings["capacity.chemicalLineNdtStartSpacingMinutes"], defaults.chemicalLine.ndtStartSpacingMinutes)),
+        loadingDefaultMinutes: Math.max(0, num(settings["capacity.chemicalLineLoadingDefaultMinutes"], defaults.chemicalLine.loadingDefaultMinutes)),
+        loadingHeavyMinutes: Math.max(0, num(settings["capacity.chemicalLineLoadingHeavyMinutes"], defaults.chemicalLine.loadingHeavyMinutes)),
+        loadingQtyThreshold: Math.max(0, num(settings["capacity.chemicalLineLoadingQtyThreshold"], defaults.chemicalLine.loadingQtyThreshold)),
+        loadingSurfaceThresholdDm2: Math.max(0, num(settings["capacity.chemicalLineLoadingSurfaceThresholdDm2"], defaults.chemicalLine.loadingSurfaceThresholdDm2)),
+        unloadingDefaultMinutes: Math.max(0, num(settings["capacity.chemicalLineUnloadingDefaultMinutes"], defaults.chemicalLine.unloadingDefaultMinutes)),
+        unloadingHeavyMinutes: Math.max(0, num(settings["capacity.chemicalLineUnloadingHeavyMinutes"], defaults.chemicalLine.unloadingHeavyMinutes)),
+        unloadingQtyThreshold: Math.max(0, num(settings["capacity.chemicalLineUnloadingQtyThreshold"], defaults.chemicalLine.unloadingQtyThreshold)),
+        unloadingSurfaceThresholdDm2: Math.max(0, num(settings["capacity.chemicalLineUnloadingSurfaceThresholdDm2"], defaults.chemicalLine.unloadingSurfaceThresholdDm2)),
+        existingSchedulePolicy: key(settings["capacity.chemicalLineExistingSchedulePolicy"]) === "PHYSICAL_ONLY" ? "PHYSICAL_ONLY" : "CONSERVATIVE_PROCESS_BLOCK",
+      },
     };
   } catch {
     return defaults;

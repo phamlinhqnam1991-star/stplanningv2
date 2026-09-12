@@ -92,3 +92,11 @@ Run separately in Aiven Query Editor:
 No SQL file exceeds the requested maximum of 8 statements/queries.
 
 All values marked `seedVersion=v017`, `assumption=true` or `assumptionBaseline=true` are editable configuration seeds, not source facts.
+
+---
+
+# ST Planning Clean Rebuild v018 — Chemical Line Segmented Finite Scheduler
+
+v018 replaces the Chemical Line one-block capacity approximation with `Loading → Process → Wait NDT → NDT → Unloading` simulation on 6 Flybars. It enforces maximum 3 concurrent Process segments, 5h NDT for Recipe `001/009/016/025`, and 1h30 minimum NDT-start spacing. Loading/Unloading tiers and all Chemical Line constraints are configuration-driven.
+
+Upgrade from v017: run only `db/31_chemical_line_segmented_v018.sql` (3 statements). Optional verification: `db/verify_v018_chemical.sql` (6 queries).
