@@ -88,6 +88,16 @@ export type ManualWorkCapacityModel = {
   rules: ManualCapacityRule[];
 };
 
+export type SmartBatchSplitModel = {
+  enabled: boolean;
+  onlyWhenTargetRecovery: boolean;
+  delayThresholdMinutes: number;
+  minReadyJobs: number;
+  minReadySurfaceDm2: number;
+  maxParts: number;
+  splitPenaltyMinutes: number;
+};
+
 export type CapacityModel = {
   resources: Record<string, CapacityResourceDefinition>;
   resourceList: CapacityResourceDefinition[];
@@ -103,6 +113,8 @@ export type CapacityModel = {
   groupBySourceOperation: boolean;
   mainBatchGateMode: "ALL_MEMBER_ROUTE_READY";
   manualPrerequisiteGateMode: "CONSECUTIVE_ROUTE_MANUAL_CHAIN";
+  dependencyGraphEnabled: boolean;
+  smartBatchSplit: SmartBatchSplitModel;
   chemicalLine: ChemicalLineCapacityModel;
   painting: PaintingCapacityModel;
   manualWork: ManualWorkCapacityModel;
@@ -134,6 +146,11 @@ export async function getCapacityModel(): Promise<CapacityModel> {
     includeExistingSchedule: true, proposedBatchPrefix: "PROP",
     unmappedResourcePolicy: "REVIEW_UNCONSTRAINED", groupBySourceOperation: true,
     mainBatchGateMode: "ALL_MEMBER_ROUTE_READY", manualPrerequisiteGateMode: "CONSECUTIVE_ROUTE_MANUAL_CHAIN",
+    dependencyGraphEnabled: true,
+    smartBatchSplit: {
+      enabled: true, onlyWhenTargetRecovery: true, delayThresholdMinutes: 60, minReadyJobs: 2,
+      minReadySurfaceDm2: 500, maxParts: 3, splitPenaltyMinutes: 10,
+    },
     chemicalLine: {
       enabled: true, resourceCode: "FLYBAR", processMaxConcurrent: 3, ndtRecipeNos: ["001","009","016","025"],
       ndtMinutes: 300, ndtStartSpacingMinutes: 90, loadingDefaultMinutes: 30, loadingHeavyMinutes: 45,
@@ -227,6 +244,16 @@ export async function getCapacityModel(): Promise<CapacityModel> {
       groupBySourceOperation: bool(settings["capacity.groupBySourceOperation"], defaults.groupBySourceOperation),
       mainBatchGateMode: key(settings["capacity.mainBatchGateMode"]) === "ALL_MEMBER_ROUTE_READY" ? "ALL_MEMBER_ROUTE_READY" : defaults.mainBatchGateMode,
       manualPrerequisiteGateMode: key(settings["capacity.manualPrerequisiteGateMode"]) === "CONSECUTIVE_ROUTE_MANUAL_CHAIN" ? "CONSECUTIVE_ROUTE_MANUAL_CHAIN" : defaults.manualPrerequisiteGateMode,
+      dependencyGraphEnabled: bool(settings["capacity.dependencyGraphEnabled"], defaults.dependencyGraphEnabled),
+      smartBatchSplit: {
+        enabled: bool(settings["capacity.smartBatchSplitEnabled"], defaults.smartBatchSplit.enabled),
+        onlyWhenTargetRecovery: bool(settings["capacity.smartBatchSplitOnlyWhenTargetRecovery"], defaults.smartBatchSplit.onlyWhenTargetRecovery),
+        delayThresholdMinutes: Math.max(0, Math.min(24*60, num(settings["capacity.smartBatchSplitDelayThresholdMinutes"], defaults.smartBatchSplit.delayThresholdMinutes))),
+        minReadyJobs: Math.max(1, Math.min(100, Math.trunc(num(settings["capacity.smartBatchSplitMinReadyJobs"], defaults.smartBatchSplit.minReadyJobs)))),
+        minReadySurfaceDm2: Math.max(0, num(settings["capacity.smartBatchSplitMinReadySurfaceDm2"], defaults.smartBatchSplit.minReadySurfaceDm2)),
+        maxParts: Math.max(2, Math.min(8, Math.trunc(num(settings["capacity.smartBatchSplitMaxParts"], defaults.smartBatchSplit.maxParts)))),
+        splitPenaltyMinutes: Math.max(0, Math.min(24*60, num(settings["capacity.smartBatchSplitPenaltyMinutes"], defaults.smartBatchSplit.splitPenaltyMinutes))),
+      },
       chemicalLine: {
         enabled: bool(settings["capacity.chemicalLineSegmented"], defaults.chemicalLine.enabled),
         resourceCode: text(settings["capacity.chemicalLineResourceCode"], defaults.chemicalLine.resourceCode),

@@ -55,6 +55,30 @@ export type CapacityBatchPrerequisite = {
   endAt: string | null;
 };
 
+export type CapacityBatchDependency = {
+  batchNo: string;
+  mainOperationCode: string;
+  operationCodes: string[];
+  jobs: string[];
+  completeAt: string | null;
+  readyAt: string | null;
+};
+
+export type CapacityDependencyEdge = {
+  fromBatchNo: string;
+  toBatchNo: string;
+  jobNum: string;
+  fromMainOperationCode: string;
+  toMainOperationCode: string;
+  fromOperationCode: string;
+  toOperationCode: string;
+  fromRoutePosition: number | null;
+  toRoutePosition: number | null;
+  lagMinutes: number;
+  readyAt: string | null;
+  blocking: boolean;
+};
+
 export type ProposedCapacityBatch = {
   id: string;
   batchNo: string;
@@ -81,6 +105,15 @@ export type ProposedCapacityBatch = {
   prerequisiteManualLoadMinutes: number;
   prerequisiteManualCompleteAt: string | null;
   prerequisiteManualBatches: CapacityBatchPrerequisite[];
+  dependencyBatchCount: number;
+  dependencyJobCount: number;
+  dependencyBatches: CapacityBatchDependency[];
+  blockingJobs: string[];
+  smartSplitApplied: boolean;
+  splitParentKey: string | null;
+  splitPartIndex: number | null;
+  splitPartCount: number | null;
+  splitReason: string | null;
   status: "FIXED" | "ON_TIME" | "LATE_START" | "UNSCHEDULED" | "DEPENDENCY_CONFLICT";
   reason: string | null;
   warnings: string[];
@@ -134,6 +167,11 @@ export type FiniteCapacityResult = {
     selectedCandidateSurface: number;
     processTimeForecastSurface: number;
     finiteCapacityForecastSurface: number;
+    baselineFiniteCapacityForecastSurface: number;
+    splitRecoveredSurface: number;
+    dependencyEdgeCount: number;
+    splitBatchCount: number;
+    splitSourceBatchCount: number;
     remainingGap: number;
     achievementPct: number;
     proposedBatchCount: number;
@@ -148,6 +186,7 @@ export type FiniteCapacityResult = {
   jobs: CapacityJobResult[];
   timeline: CapacityTimelineEntry[];
   resources: CapacityResourceSummary[];
+  dependencies: CapacityDependencyEdge[];
   warnings: string[];
 };
 
@@ -176,6 +215,17 @@ type BatchPrerequisiteInternal = {
   start: number | null;
   end: number | null;
 };
+type BatchDependencyInternal = {
+  nodeId: string;
+  batchNo: string;
+  mainOperationCode: string;
+  operationCodes: string[];
+  jobs: string[];
+  completeAt: number | null;
+  readyAt: number | null;
+};
+type SplitAssignment = { partIndex: number; partCount: number; reason: string; parentGroupKey: string };
+
 type BatchNode = {
   id: string;
   sourceKind: "FIXED_SCHEDULE" | "EXISTING_BATCH" | "PROPOSED_BATCH";
@@ -199,6 +249,13 @@ type BatchNode = {
   prerequisiteManualLoadMinutes: number;
   prerequisiteManualCompleteAt: number | null;
   prerequisiteManualBatches: BatchPrerequisiteInternal[];
+  dependencyBatches: BatchDependencyInternal[];
+  blockingJobs: string[];
+  sourceGroupKey: string;
+  splitParentKey: string | null;
+  splitPartIndex: number | null;
+  splitPartCount: number | null;
+  splitReason: string | null;
   status: ProposedCapacityBatch["status"];
   reason: string | null;
   warnings: string[];
@@ -225,6 +282,9 @@ type OccupancyInterval = {
 type OccupancyState = { intervals: OccupancyInterval[] };
 type Simulation = {
   nodes: BatchNode[];
+  chains: JobChain[];
+  memberNode: Map<string,string>;
+  dependencies: CapacityDependencyEdge[];
   jobs: CapacityJobResult[];
   timeline: CapacityTimelineEntry[];
   resources: CapacityResourceSummary[];
@@ -601,24 +661,47 @@ function batchDuration(members:MemberDraft[],proposal:BatchProposal|null):number
 }
 function batchLatestStart(members:MemberDraft[]):number|null{return minDate(members.map(x=>parseWall(x.step.latestStart)));}
 
-function buildNodes(chains:JobChain[],capacityModel:CapacityModel):{nodes:BatchNode[];memberNode:Map<string,string>} {
-  const groups=new Map<string,MemberDraft[]>();for(const c of chains)for(const m of c.members){const a=groups.get(m.groupKey)||[];a.push(m);groups.set(m.groupKey,a);}
+function buildNodes(chains:JobChain[],capacityModel:CapacityModel,splitAssignments:Map<string,SplitAssignment>|null=null):{nodes:BatchNode[];memberNode:Map<string,string>} {
+  const groups=new Map<string,MemberDraft[]>();
+  for(const c of chains){
+    for(const m of c.members){
+      const split=splitAssignments?.get(m.key);
+      const groupKey=split&&m.groupKey.startsWith("PROP:")?`${m.groupKey}|SMART_SPLIT:${split.partIndex}/${split.partCount}`:m.groupKey;
+      const a=groups.get(groupKey)||[];a.push(m);groups.set(groupKey,a);
+    }
+  }
   const nodes:BatchNode[]=[];const memberNode=new Map<string,string>();let seq=0;
-  for(const [groupKey,members0] of groups){
+  for(const [effectiveGroupKey,members0] of groups){
     const members=[...members0].sort((a,b)=>(a.step.latestStart||"9999").localeCompare(b.step.latestStart||"9999")||a.row.jobNum.localeCompare(b.row.jobNum));
-    if(groupKey.startsWith("FIX:")||groupKey.startsWith("EX:")){
-      const first=members[0];const main=first.step.mainOperation!;const fixed=groupKey.startsWith("FIX:");const id=`N${++seq}`;
+    const firstSplit=splitAssignments?.get(members[0]?.key||"")||null;
+    const sourceGroupKey=members[0]?.groupKey||effectiveGroupKey;
+    const splitFields={
+      sourceGroupKey,
+      splitParentKey:firstSplit?.parentGroupKey||null,
+      splitPartIndex:firstSplit?.partIndex??null,
+      splitPartCount:firstSplit?.partCount??null,
+      splitReason:firstSplit?.reason||null,
+    };
+    if(effectiveGroupKey.startsWith("FIX:")||effectiveGroupKey.startsWith("EX:")){
+      const first=members[0];const main=first.step.mainOperation!;const fixed=effectiveGroupKey.startsWith("FIX:");const id=`N${++seq}`;
       const starts=members.map(x=>parseWall(x.step.scheduleStart)).filter((x):x is number=>x!=null);const ends=members.map(x=>parseWall(x.step.scheduleEnd)).filter((x):x is number=>x!=null);
-      const node:BatchNode={id,sourceKind:fixed?"FIXED_SCHEDULE":"EXISTING_BATCH",batchNo:first.step.batchNo||groupKey.slice(3),batchKey:null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members,durationMinutes:batchDuration(members,null),ruleCode:null,resourceOptions:main.resources.map(x=>x.code),fixedStart:fixed&&starts.length?Math.min(...starts):null,fixedEnd:fixed&&ends.length?Math.max(...ends):null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(members),batchReadyAt:null,prerequisiteManualLoadMinutes:0,prerequisiteManualCompleteAt:null,prerequisiteManualBatches:[],status:fixed?"FIXED":"UNSCHEDULED",reason:null,warnings:[],segments:[]};
+      const node:BatchNode={id,sourceKind:fixed?"FIXED_SCHEDULE":"EXISTING_BATCH",batchNo:first.step.batchNo||effectiveGroupKey.slice(3),batchKey:null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members,durationMinutes:batchDuration(members,null),ruleCode:null,resourceOptions:main.resources.map(x=>x.code),fixedStart:fixed&&starts.length?Math.min(...starts):null,fixedEnd:fixed&&ends.length?Math.max(...ends):null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(members),batchReadyAt:null,prerequisiteManualLoadMinutes:0,prerequisiteManualCompleteAt:null,prerequisiteManualBatches:[],dependencyBatches:[],blockingJobs:[],...splitFields,status:fixed?"FIXED":"UNSCHEDULED",reason:null,warnings:[],segments:[]};
       nodes.push(node);for(const m of members)memberNode.set(m.key,id);continue;
     }
     const proposal=members[0].proposal;let chunk:MemberDraft[]=[];let chunkNo=0;
-    const flush=()=>{if(!chunk.length)return;const first=chunk[0],main=first.step.mainOperation!;const id=`N${++seq}`;const short=main.shortCode||main.code.slice(0,3);const batchNo=`${capacityModel.proposedBatchPrefix}_${short}_${String(++chunkNo).padStart(3,"0")}`;const node:BatchNode={id,sourceKind:"PROPOSED_BATCH",batchNo,batchKey:proposal?.batchKey||null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members:chunk,durationMinutes:batchDuration(chunk,proposal),ruleCode:proposal?.ruleCode||null,resourceOptions:main.resources.map(x=>x.code),fixedStart:null,fixedEnd:null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(chunk),batchReadyAt:null,prerequisiteManualLoadMinutes:0,prerequisiteManualCompleteAt:null,prerequisiteManualBatches:[],status:"UNSCHEDULED",reason:null,warnings:proposal?.warnings||[],segments:[]};nodes.push(node);for(const m of chunk)memberNode.set(m.key,id);chunk=[];};
+    const flush=()=>{
+      if(!chunk.length)return;
+      const first=chunk[0],main=first.step.mainOperation!;const id=`N${++seq}`;const short=main.shortCode||main.code.slice(0,3);const batchNo=`${capacityModel.proposedBatchPrefix}_${short}_${String(++chunkNo).padStart(3,"0")}`;
+      const splitPenalty=firstSplit?capacityModel.smartBatchSplit.splitPenaltyMinutes:0;
+      const node:BatchNode={id,sourceKind:"PROPOSED_BATCH",batchNo,batchKey:proposal?.batchKey||null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members:chunk,durationMinutes:batchDuration(chunk,proposal)+splitPenalty,ruleCode:proposal?.ruleCode||null,resourceOptions:main.resources.map(x=>x.code),fixedStart:null,fixedEnd:null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(chunk),batchReadyAt:null,prerequisiteManualLoadMinutes:0,prerequisiteManualCompleteAt:null,prerequisiteManualBatches:[],dependencyBatches:[],blockingJobs:[],...splitFields,status:"UNSCHEDULED",reason:null,warnings:[...(proposal?.warnings||[]),...(firstSplit?["SMART_BATCH_SPLIT",`SMART_SPLIT_PART:${firstSplit.partIndex}/${firstSplit.partCount}`,`SMART_SPLIT_PENALTY_MIN:${splitPenalty}`]:[])],segments:[]};
+      nodes.push(node);for(const m of chunk)memberNode.set(m.key,id);chunk=[];
+    };
     for(const m of members){
       const repeatsSameJob=chunk.some((x)=>x.row.planningJobId===m.row.planningJobId);
       if(repeatsSameJob||(proposal&&limitExceeded(chunk,m,proposal)))flush();
       chunk.push(m);
-    }flush();
+    }
+    flush();
   }
   return{nodes,memberNode};
 }
@@ -656,12 +739,52 @@ function routeManualPrerequisites(node:BatchNode,nodeMap:Map<string,BatchNode>,m
   })).sort((a,b)=>(a.end??Number.POSITIVE_INFINITY)-(b.end??Number.POSITIVE_INFINITY)||a.batchNo.localeCompare(b.batchNo));
 }
 
-function applyBatchGateAudit(node:BatchNode,nodeMap:Map<string,BatchNode>,memberNode:Map<string,string>,capacityModel:CapacityModel,ready:number):void{
+function memberRouteReadyAt(member:MemberDraft,nodeMap:Map<string,BatchNode>,memberNode:Map<string,string>,scenarioStart:number):number|null{
+  let ready=scenarioStart+member.lagBeforeMinutes*60_000;
+  if(!member.previousMemberKey)return ready;
+  const prevId=memberNode.get(member.previousMemberKey);
+  if(!prevId)return ready;
+  const prev=nodeMap.get(prevId);
+  if(!prev||prev.end==null)return null;
+  if(prev.id===memberNode.get(member.key))return ready;
+  return prev.end+member.lagBeforeMinutes*60_000;
+}
+
+function routeBatchDependencies(node:BatchNode,nodeMap:Map<string,BatchNode>,memberNode:Map<string,string>,scenarioStart:number):BatchDependencyInternal[]{
+  const grouped=new Map<string,{node:BatchNode;jobs:Set<string>;ops:Set<string>;ready:number|null}>();
+  for(const member of node.members){
+    if(!member.previousMemberKey)continue;
+    const prevId=memberNode.get(member.previousMemberKey);
+    if(!prevId||prevId===node.id)continue;
+    const prev=nodeMap.get(prevId);if(!prev)continue;
+    let entry=grouped.get(prevId);
+    if(!entry){entry={node:prev,jobs:new Set<string>(),ops:new Set<string>(),ready:null};grouped.set(prevId,entry);}
+    entry.jobs.add(member.row.jobNum);
+    const prevMember=prev.members.find(pm=>pm.key===member.previousMemberKey)||prev.members.find(pm=>pm.row.planningJobId===member.row.planningJobId);
+    if(prevMember)entry.ops.add(prevMember.step.operationCode);
+    const ready=memberRouteReadyAt(member,nodeMap,memberNode,scenarioStart);
+    if(ready!=null)entry.ready=entry.ready==null?ready:Math.max(entry.ready,ready);
+  }
+  return [...grouped.entries()].map(([nodeId,entry])=>({
+    nodeId,batchNo:entry.node.batchNo,mainOperationCode:entry.node.mainOperation.code,operationCodes:[...entry.ops].sort(),jobs:[...entry.jobs].sort(),completeAt:entry.node.end,readyAt:entry.ready,
+  })).sort((a,b)=>(a.readyAt??Number.POSITIVE_INFINITY)-(b.readyAt??Number.POSITIVE_INFINITY)||a.batchNo.localeCompare(b.batchNo));
+}
+
+function applyBatchGateAudit(node:BatchNode,nodeMap:Map<string,BatchNode>,memberNode:Map<string,string>,capacityModel:CapacityModel,ready:number,scenarioStart:number):void{
   node.batchReadyAt=Number.isFinite(ready)?ready:null;
+  const dependencies=routeBatchDependencies(node,nodeMap,memberNode,scenarioStart);
+  node.dependencyBatches=dependencies;
+  const blocking=new Set<string>();
+  for(const member of node.members){
+    const memberReady=memberRouteReadyAt(member,nodeMap,memberNode,scenarioStart);
+    if(memberReady!=null&&node.batchReadyAt!=null&&Math.abs(memberReady-node.batchReadyAt)<1000)blocking.add(member.row.jobNum);
+  }
+  node.blockingJobs=[...blocking].sort();
   const prerequisites=routeManualPrerequisites(node,nodeMap,memberNode,capacityModel);
   node.prerequisiteManualBatches=prerequisites;
   node.prerequisiteManualLoadMinutes=prerequisites.reduce((sum,x)=>sum+x.loadMinutes,0);
   node.prerequisiteManualCompleteAt=maxDate(prerequisites.map(x=>x.end));
+  if(dependencies.length)node.warnings=[...new Set([...node.warnings,`ROUTE_DEPENDENCY_BATCHES:${dependencies.length}`,`BLOCKING_JOBS:${node.blockingJobs.length}`])];
   if(prerequisites.length){
     const jobs=new Set(prerequisites.flatMap(x=>x.jobs));
     node.warnings=[...new Set([...node.warnings,"ALL_BATCH_JOBS_READY_GATE",`MANUAL_PREREQ_BATCHES:${prerequisites.length}`,`MANUAL_PREREQ_JOBS:${jobs.size}`,`MANUAL_PREREQ_LOAD_MIN:${Math.round(node.prerequisiteManualLoadMinutes)}`])];
@@ -675,7 +798,7 @@ function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:O
     const readyNodes=[...pending].map(id=>map.get(id)!).filter(node=>node.members.every(m=>!m.previousMemberKey||memberNode.get(m.previousMemberKey)===node.id||!pending.has(memberNode.get(m.previousMemberKey)||"")));
     if(!readyNodes.length){for(const id of pending){const x=map.get(id)!;x.status="DEPENDENCY_CONFLICT";x.reason="CYCLIC_OR_UNRESOLVED_DEPENDENCY";}break;}
     readyNodes.sort((a,b)=>(a.mustStartBy??Number.POSITIVE_INFINITY)-(b.mustStartBy??Number.POSITIVE_INFINITY)||(a.sourceKind==="EXISTING_BATCH"?-1:1)-(b.sourceKind==="EXISTING_BATCH"?-1:1)||b.members.reduce((s,x)=>s+x.row.surfaceDm2,0)-a.members.reduce((s,x)=>s+x.row.surfaceDm2,0));
-    const node=readyNodes[0];pending.delete(node.id);const dep=predecessorReady(node,map,memberNode,scenarioStart);applyBatchGateAudit(node,map,memberNode,capacityModel,dep.ready);
+    const node=readyNodes[0];pending.delete(node.id);const dep=predecessorReady(node,map,memberNode,scenarioStart);applyBatchGateAudit(node,map,memberNode,capacityModel,dep.ready,scenarioStart);
     if(node.sourceKind==="FIXED_SCHEDULE"){
       node.start=node.fixedStart;node.end=node.fixedEnd;if(dep.conflict){node.status="DEPENDENCY_CONFLICT";node.reason="FIXED_SCHEDULE_STARTS_BEFORE_JOB_IS_READY";}else node.status="FIXED";
       const match=state.intervals.find(x=>key(x.batchRef)===key(node.batchNo)&&node.start!=null&&node.end!=null&&overlap(node.start,node.end,x.start,x.end));if(match){node.resourceBase=match.baseResourceCode;node.resourceInstance=match.resourceInstance;}
@@ -748,18 +871,87 @@ function resourceSummary(state:OccupancyState,nodes:BatchNode[],model:CapacityMo
   });
 }
 
-async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,rawMap:Map<number,RawContext>,planningModel:PlanningModel,batchModel:Awaited<ReturnType<typeof getBatchModel>>,capacityModel:CapacityModel,recipeModel:RecipeModel,baseOccupancy:OccupancyState,scenarioStart:number,cutoff:number,horizonEnd:number):Promise<Simulation>{
-  const chains=buildChains(rows,rawMap,planningModel,batchModel,capacityModel);const {nodes,memberNode}=buildNodes(chains,capacityModel);const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,recipeModel,scenarioStart,horizonEnd);const jobs=evaluateJobs(chains,nodes,memberNode,scenarioStart,cutoff);const feasiblePlannedSurface=jobs.filter(x=>x.sourceStatus==="PLANNED"&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const feasibleCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const selectedCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)).reduce((s,x)=>s+x.surfaceDm2,0);const warnings:string[]=[];if(chains.some(x=>x.capacityReview))warnings.push("UNMAPPED_AREA_CAPACITY_REVIEW");if(nodes.some(x=>x.status==="UNSCHEDULED"))warnings.push("ONE_OR_MORE_BATCHES_HAVE_NO_CAPACITY_SLOT");if(nodes.some(x=>x.status==="DEPENDENCY_CONFLICT"))warnings.push("SCHEDULE_PRECEDENCE_CONFLICT");if(capacityModel.chemicalLine.enabled&&baseOccupancy.intervals.some(x=>key(x.baseResourceCode)===key(capacityModel.chemicalLine.resourceCode))&&capacityModel.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")warnings.push("EXISTING_CHEMICAL_SCHEDULE_IS_TREATED_AS_CONSERVATIVE_PROCESS_OCCUPANCY");if(capacityModel.manualWork.enabled&&nodes.some(x=>isManualWorkNode(x,capacityModel)))warnings.push("MASKING_UNMASKING_WORKSTATION_AND_LABOR_CAPACITY_ACTIVE");return{nodes,jobs,timeline:timelineRows(state,capacityModel,scenarioStart,horizonEnd),resources:resourceSummary(state,nodes,capacityModel,scenarioStart,cutoff),feasiblePlannedSurface,feasibleCandidateSurface,selectedCandidateSurface,warnings};
+function buildDependencyEdges(chains:JobChain[],nodes:BatchNode[],memberNode:Map<string,string>,scenarioStart:number,enabled:boolean):CapacityDependencyEdge[]{
+  if(!enabled)return[];
+  const nodeMap=new Map(nodes.map(x=>[x.id,x]));const memberByKey=new Map<string,MemberDraft>();
+  for(const chain of chains)for(const member of chain.members)memberByKey.set(member.key,member);
+  const edges:CapacityDependencyEdge[]=[];const seen=new Set<string>();
+  for(const toNode of nodes){
+    for(const member of toNode.members){
+      if(!member.previousMemberKey)continue;
+      const fromId=memberNode.get(member.previousMemberKey);if(!fromId||fromId===toNode.id)continue;
+      const fromNode=nodeMap.get(fromId);const fromMember=memberByKey.get(member.previousMemberKey);if(!fromNode||!fromMember)continue;
+      const ready=fromNode.end==null?null:fromNode.end+member.lagBeforeMinutes*60_000;
+      const edgeKey=`${fromId}|${toNode.id}|${member.row.planningJobId}|${member.key}`;if(seen.has(edgeKey))continue;seen.add(edgeKey);
+      edges.push({
+        fromBatchNo:fromNode.batchNo,toBatchNo:toNode.batchNo,jobNum:member.row.jobNum,
+        fromMainOperationCode:fromNode.mainOperation.code,toMainOperationCode:toNode.mainOperation.code,
+        fromOperationCode:fromMember.step.operationCode,toOperationCode:member.step.operationCode,
+        fromRoutePosition:fromMember.step.routePosition??null,toRoutePosition:member.step.routePosition??null,
+        lagMinutes:member.lagBeforeMinutes,readyAt:wallIso(ready),
+        blocking:ready!=null&&toNode.batchReadyAt!=null&&Math.abs(ready-toNode.batchReadyAt)<1000,
+      });
+    }
+  }
+  return edges.sort((a,b)=>(a.readyAt||"9999").localeCompare(b.readyAt||"9999")||a.toBatchNo.localeCompare(b.toBatchNo)||a.jobNum.localeCompare(b.jobNum));
+}
+
+function deriveSmartSplitAssignments(baseline:Simulation,capacityModel:CapacityModel,scenarioStart:number):Map<string,SplitAssignment>{
+  const cfg=capacityModel.smartBatchSplit;const out=new Map<string,SplitAssignment>();if(!cfg.enabled)return out;
+  const nodeMap=new Map(baseline.nodes.map(x=>[x.id,x]));const threshold=Math.max(0,cfg.delayThresholdMinutes)*60_000;
+  for(const node of baseline.nodes){
+    if(node.sourceKind!=="PROPOSED_BATCH"||node.members.length<=cfg.minReadyJobs)continue;
+    const rows=node.members.map(member=>({member,ready:memberRouteReadyAt(member,nodeMap,baseline.memberNode,scenarioStart)})).filter((x):x is {member:MemberDraft;ready:number}=>x.ready!=null&&Number.isFinite(x.ready));
+    if(rows.length!==node.members.length||rows.length<=cfg.minReadyJobs)continue;
+    rows.sort((a,b)=>a.ready-b.ready||a.member.row.jobNum.localeCompare(b.member.row.jobNum));
+    const spread=rows[rows.length-1].ready-rows[0].ready;if(spread<threshold||threshold<=0)continue;
+    const parts:Array<typeof rows>=[];let current:Array<typeof rows[number]>=[];
+    const qualifies=(items:Array<typeof rows[number]>)=>items.length>=cfg.minReadyJobs&&items.reduce((sum,x)=>sum+x.member.row.surfaceDm2,0)>=cfg.minReadySurfaceDm2;
+    for(const row of rows){
+      if(current.length&&parts.length<cfg.maxParts-1&&row.ready-current[current.length-1].ready>=threshold&&qualifies(current)){parts.push(current);current=[];}
+      current.push(row);
+    }
+    if(current.length)parts.push(current);
+    if(parts.length<2||!qualifies(parts[0]))continue;
+    const reason=`ROUTE_READY_SPREAD_${Math.round(spread/60_000)}MIN`;
+    for(let i=0;i<parts.length;i++)for(const row of parts[i])out.set(row.member.key,{partIndex:i+1,partCount:parts.length,reason,parentGroupKey:`${node.sourceGroupKey}|BASE:${node.id}`});
+  }
+  return out;
+}
+
+async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,rawMap:Map<number,RawContext>,planningModel:PlanningModel,batchModel:Awaited<ReturnType<typeof getBatchModel>>,capacityModel:CapacityModel,recipeModel:RecipeModel,baseOccupancy:OccupancyState,scenarioStart:number,cutoff:number,horizonEnd:number,splitAssignments:Map<string,SplitAssignment>|null=null):Promise<Simulation>{
+  const chains=buildChains(rows,rawMap,planningModel,batchModel,capacityModel);
+  const {nodes,memberNode}=buildNodes(chains,capacityModel,splitAssignments);
+  const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,recipeModel,scenarioStart,horizonEnd);
+  const dependencies=buildDependencyEdges(chains,nodes,memberNode,scenarioStart,capacityModel.dependencyGraphEnabled);
+  const jobs=evaluateJobs(chains,nodes,memberNode,scenarioStart,cutoff);
+  const feasiblePlannedSurface=jobs.filter(x=>x.sourceStatus==="PLANNED"&&x.contributes).reduce((sum,x)=>sum+x.surfaceDm2,0);
+  const feasibleCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)&&x.contributes).reduce((sum,x)=>sum+x.surfaceDm2,0);
+  const selectedCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)).reduce((sum,x)=>sum+x.surfaceDm2,0);
+  const warnings:string[]=[];
+  if(chains.some(x=>x.capacityReview))warnings.push("UNMAPPED_AREA_CAPACITY_REVIEW");
+  if(nodes.some(x=>x.status==="UNSCHEDULED"))warnings.push("ONE_OR_MORE_BATCHES_HAVE_NO_CAPACITY_SLOT");
+  if(nodes.some(x=>x.status==="DEPENDENCY_CONFLICT"))warnings.push("SCHEDULE_PRECEDENCE_CONFLICT");
+  if(capacityModel.chemicalLine.enabled&&baseOccupancy.intervals.some(x=>key(x.baseResourceCode)===key(capacityModel.chemicalLine.resourceCode))&&capacityModel.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")warnings.push("EXISTING_CHEMICAL_SCHEDULE_IS_TREATED_AS_CONSERVATIVE_PROCESS_OCCUPANCY");
+  if(capacityModel.manualWork.enabled&&nodes.some(x=>isManualWorkNode(x,capacityModel)))warnings.push("MASKING_UNMASKING_WORKSTATION_AND_LABOR_CAPACITY_ACTIVE");
+  if(capacityModel.dependencyGraphEnabled&&dependencies.length)warnings.push(`FULL_ROUTE_DEPENDENCY_EDGES:${dependencies.length}`);
+  if(nodes.some(x=>x.splitParentKey))warnings.push("SMART_BATCH_SPLIT_APPLIED");
+  return{nodes,chains,memberNode,dependencies,jobs,timeline:timelineRows(state,capacityModel,scenarioStart,horizonEnd),resources:resourceSummary(state,nodes,capacityModel,scenarioStart,cutoff),feasiblePlannedSurface,feasibleCandidateSurface,selectedCandidateSurface,warnings};
 }
 
 function nodeToPublic(node:BatchNode):ProposedCapacityBatch{
   const prerequisiteJobs=[...new Set(node.prerequisiteManualBatches.flatMap(x=>x.jobs))];
+  const dependencyJobs=[...new Set(node.dependencyBatches.flatMap(x=>x.jobs))];
   return{
     id:node.id,batchNo:node.batchNo,sourceKind:node.sourceKind,mainOperationCode:node.mainOperation.code,mainOperationLabel:node.mainOperation.label,batchKey:node.batchKey,
-    recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),totalQty:node.members.reduce((s,x)=>s+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((s,x)=>s+x.row.surfaceDm2,0),
+    recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),totalQty:node.members.reduce((sum,x)=>sum+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((sum,x)=>sum+x.row.surfaceDm2,0),
     durationMinutes:node.durationMinutes,batchRuleCode:node.ruleCode,resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,startAt:wallIso(node.start),endAt:wallIso(node.end),mustStartBy:wallIso(node.mustStartBy),
     batchReadyAt:wallIso(node.batchReadyAt),prerequisiteManualBatchCount:node.prerequisiteManualBatches.length,prerequisiteManualJobCount:prerequisiteJobs.length,prerequisiteManualLoadMinutes:node.prerequisiteManualLoadMinutes,prerequisiteManualCompleteAt:wallIso(node.prerequisiteManualCompleteAt),
     prerequisiteManualBatches:node.prerequisiteManualBatches.map(x=>({batchNo:x.batchNo,mainOperationCode:x.mainOperationCode,operationCodes:x.operationCodes,jobs:x.jobs,loadMinutes:x.loadMinutes,elapsedMinutes:x.start!=null&&x.end!=null?Math.max(0,Math.round((x.end-x.start)/60_000)):null,startAt:wallIso(x.start),endAt:wallIso(x.end)})),
+    dependencyBatchCount:node.dependencyBatches.length,dependencyJobCount:dependencyJobs.length,
+    dependencyBatches:node.dependencyBatches.map(x=>({batchNo:x.batchNo,mainOperationCode:x.mainOperationCode,operationCodes:x.operationCodes,jobs:x.jobs,completeAt:wallIso(x.completeAt),readyAt:wallIso(x.readyAt)})),
+    blockingJobs:node.blockingJobs,
+    smartSplitApplied:Boolean(node.splitParentKey),splitParentKey:node.splitParentKey,splitPartIndex:node.splitPartIndex,splitPartCount:node.splitPartCount,splitReason:node.splitReason,
     status:node.status,reason:node.reason,warnings:node.warnings,segments:node.segments.map(seg=>({kind:seg.kind,label:seg.label,startAt:wallIso(seg.start)!,endAt:wallIso(seg.end)!,durationMinutes:Math.round((seg.end-seg.start)/60_000),occupiesCapacity:seg.occupiesCapacity}))
   };
 }
@@ -769,15 +961,66 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
     calculateStOutputTarget({targetDate:options.targetDate,cutoffTime:options.cutoffTime,targetValue:options.targetValue}),
     getPlanningModel(),getBatchModel(),getCapacityModel(),getRecipeModel(),getConfigBootstrap(),
   ]);
-  const cutoff=wallDateTime(options.targetDate,options.cutoffTime);const routeSnapshot=parseWall(base.routeSnapshotAt);const configuredStart=wallDateTime(addDays(options.targetDate,-capacityModel.lookbackDays),capacityModel.scenarioStartTime);const scenarioStart=Math.max(configuredStart,routeSnapshot||configuredStart);const horizonEnd=cutoff+capacityModel.spillHours*60*60_000;
-  const plannedRows=base.rows.filter(x=>x.outputStatus==="PLANNED");const candidates=candidateSort(base.rows.filter(x=>x.outputStatus==="NEED_PLAN"&&!x.needsReview&&x.surfaceDm2>0));const candidateByJob=new Map(candidates.map(x=>[x.jobNum,x]));const selected:Set<number>=new Set();
+  const cutoff=wallDateTime(options.targetDate,options.cutoffTime);
+  const routeSnapshot=parseWall(base.routeSnapshotAt);
+  const configuredStart=wallDateTime(addDays(options.targetDate,-capacityModel.lookbackDays),capacityModel.scenarioStartTime);
+  const scenarioStart=Math.max(configuredStart,routeSnapshot||configuredStart);
+  const horizonEnd=cutoff+capacityModel.spillHours*60*60_000;
+  const plannedRows=base.rows.filter(x=>x.outputStatus==="PLANNED");
+  const candidates=candidateSort(base.rows.filter(x=>x.outputStatus==="NEED_PLAN"&&!x.needsReview&&x.surfaceDm2>0));
+  const candidateByJob=new Map(candidates.map(x=>[x.jobNum,x]));const selected:Set<number>=new Set();
   for(const job of base.recommendedJobNums){const row=candidateByJob.get(job);if(row)selected.add(row.planningJobId);if(selected.size>=capacityModel.maxCandidateJobs)break;}
-  const potential=candidates.slice(0,capacityModel.maxCandidateJobs);const ids=[...new Set([...plannedRows,...potential].map(x=>x.planningJobId))];const planningProfile=bootstrap.sources.PLANNING;const rawMap=await loadRawContexts(ids,planningProfile.sheetName||planningProfile.displayName);const existing=await loadExistingOccupancy(capacityModel,scenarioStart,horizonEnd);
+  const potential=candidates.slice(0,capacityModel.maxCandidateJobs);
+  const ids=[...new Set([...plannedRows,...potential].map(x=>x.planningJobId))];
+  const planningProfile=bootstrap.sources.PLANNING;
+  const rawMap=await loadRawContexts(ids,planningProfile.sheetName||planningProfile.displayName);
+  const existing=await loadExistingOccupancy(capacityModel,scenarioStart,horizonEnd);
   let sim:Simulation|null=null;let iteration=0;let cursor=0;
-  while(iteration++<8){const selectedRows=potential.filter(x=>selected.has(x.planningJobId));const capacityRows=[...plannedRows,...selectedRows];sim=await simulate(capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd);const forecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;if(forecast>=options.targetValue)break;let need=Math.max(0,options.targetValue-forecast)*capacityModel.candidateSurfaceMultiplier;let added=0;while(cursor<potential.length&&added<need&&selected.size<capacityModel.maxCandidateJobs){const row=potential[cursor++];if(selected.has(row.planningJobId))continue;selected.add(row.planningJobId);added+=row.surfaceDm2;}if(added<=0)break;}
-  const finalSelectedRows=potential.filter(x=>selected.has(x.planningJobId));
-  sim=await simulate([...plannedRows,...finalSelectedRows],selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd);
-  const finiteForecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;const remainingGap=Math.max(0,options.targetValue-finiteForecast);const contributing=sim.jobs.filter(x=>x.contributes&&selected.has(x.planningJobId));const anyReview=contributing.some(x=>x.capacityReview);const targetFeasibility:FiniteCapacityResult["targetFeasibility"]=remainingGap>0?"NOT_FEASIBLE":anyReview?"PROVISIONAL":"CONFIRMED";const publicBatches=sim.nodes.map(nodeToPublic).sort((a,b)=>(a.startAt||"9999").localeCompare(b.startAt||"9999")||(a.mustStartBy||"9999").localeCompare(b.mustStartBy||"9999"));const warnings=[...new Set(sim.warnings)];if(targetFeasibility==="PROVISIONAL")warnings.push("TARGET_REACHED_BUT_ONE_OR_MORE_CONTRIBUTING_STEPS_HAVE_NO_CONFIGURED_FINITE_RESOURCE");if(remainingGap>0)warnings.push(`FINITE_CAPACITY_GAP:${Math.round(remainingGap)}`);
+  while(iteration++<8){
+    const selectedRows=potential.filter(x=>selected.has(x.planningJobId));const capacityRows=[...plannedRows,...selectedRows];
+    sim=await simulate(capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd);
+    const forecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;
+    if(forecast>=options.targetValue)break;
+    const need=Math.max(0,options.targetValue-forecast)*capacityModel.candidateSurfaceMultiplier;let added=0;
+    while(cursor<potential.length&&added<need&&selected.size<capacityModel.maxCandidateJobs){const row=potential[cursor++];if(selected.has(row.planningJobId))continue;selected.add(row.planningJobId);added+=row.surfaceDm2;}
+    if(added<=0)break;
+  }
+  const finalSelectedRows=potential.filter(x=>selected.has(x.planningJobId));const capacityRows=[...plannedRows,...finalSelectedRows];
+  const baselineSim=await simulate(capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd);
+  const baselineFiniteForecast=base.summary.actualSurface+base.summary.committedSurface+baselineSim.feasiblePlannedSurface+baselineSim.feasibleCandidateSurface;
+  let finalSim=baselineSim;let splitRecoveredSurface=0;let splitSourceBatchCount=0;
+  const mayTrySplit=capacityModel.smartBatchSplit.enabled&&(!capacityModel.smartBatchSplit.onlyWhenTargetRecovery||baselineFiniteForecast<options.targetValue);
+  if(mayTrySplit){
+    const splitAssignments=deriveSmartSplitAssignments(baselineSim,capacityModel,scenarioStart);
+    if(splitAssignments.size){
+      splitSourceBatchCount=new Set([...splitAssignments.values()].map(x=>x.parentGroupKey)).size;
+      const splitSim=await simulate(capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd,splitAssignments);
+      const splitForecast=base.summary.actualSurface+base.summary.committedSurface+splitSim.feasiblePlannedSurface+splitSim.feasibleCandidateSurface;
+      const baselineProblems=baselineSim.nodes.filter(x=>x.status==="LATE_START"||x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length;
+      const splitProblems=splitSim.nodes.filter(x=>x.status==="LATE_START"||x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length;
+      if(splitForecast>baselineFiniteForecast+0.001||(!capacityModel.smartBatchSplit.onlyWhenTargetRecovery&&splitForecast>=baselineFiniteForecast-0.001&&splitProblems<baselineProblems)){
+        finalSim=splitSim;splitRecoveredSurface=Math.max(0,splitForecast-baselineFiniteForecast);
+      }else splitSourceBatchCount=0;
+    }
+  }
+  sim=finalSim;
+  const finiteForecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;
+  const remainingGap=Math.max(0,options.targetValue-finiteForecast);
+  const contributing=sim.jobs.filter(x=>x.contributes&&selected.has(x.planningJobId));
+  const anyReview=contributing.some(x=>x.capacityReview);
+  const targetFeasibility:FiniteCapacityResult["targetFeasibility"]=remainingGap>0?"NOT_FEASIBLE":anyReview?"PROVISIONAL":"CONFIRMED";
+  const publicBatches=sim.nodes.map(nodeToPublic).sort((a,b)=>(a.startAt||"9999").localeCompare(b.startAt||"9999")||(a.mustStartBy||"9999").localeCompare(b.mustStartBy||"9999"));
+  const splitBatchCount=publicBatches.filter(x=>x.smartSplitApplied).length;
+  if(splitBatchCount&&!splitSourceBatchCount)splitSourceBatchCount=new Set(publicBatches.filter(x=>x.smartSplitApplied&&x.splitParentKey).map(x=>x.splitParentKey!)).size;
+  const warnings=[...new Set(sim.warnings)];
+  if(splitBatchCount)warnings.push(`SMART_BATCH_SPLIT_BATCHES:${splitBatchCount}`,`SMART_BATCH_SPLIT_RECOVERED_DM2:${Math.round(splitRecoveredSurface)}`);
+  if(targetFeasibility==="PROVISIONAL")warnings.push("TARGET_REACHED_BUT_ONE_OR_MORE_CONTRIBUTING_STEPS_HAVE_NO_CONFIGURED_FINITE_RESOURCE");
+  if(remainingGap>0)warnings.push(`FINITE_CAPACITY_GAP:${Math.round(remainingGap)}`);
   const processTimeForecast=base.summary.actualSurface+base.summary.committedSurface+sumSurface(plannedRows)+sim.selectedCandidateSurface;
-  return{targetDate:options.targetDate,cutoffTime:options.cutoffTime,cutoffAt:wallIso(cutoff)!,targetValue:options.targetValue,scenarioStartAt:wallIso(scenarioStart)!,horizonEndAt:wallIso(horizonEnd)!,endpointOperation:base.endpointOperation,targetFeasibility,summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length},selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,warnings};
+  return{
+    targetDate:options.targetDate,cutoffTime:options.cutoffTime,cutoffAt:wallIso(cutoff)!,targetValue:options.targetValue,scenarioStartAt:wallIso(scenarioStart)!,horizonEndAt:wallIso(horizonEnd)!,endpointOperation:base.endpointOperation,targetFeasibility,
+    summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,baselineFiniteCapacityForecastSurface:baselineFiniteForecast,splitRecoveredSurface,dependencyEdgeCount:sim.dependencies.length,splitBatchCount,splitSourceBatchCount,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length},
+    selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,dependencies:sim.dependencies,warnings,
+  };
 }
+

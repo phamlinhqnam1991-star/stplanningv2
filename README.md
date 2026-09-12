@@ -141,3 +141,7 @@ Upgrade from v017: run only `db/31_chemical_line_segmented_v018.sql` (3 statemen
 v019 replaces wet-paint one-block capacity approximation with `Setup → Application → Flash/Wait → Cure → Release` simulation across CAB1–CAB4. Cabin eligibility can be configured by Main Operation and Recipe No.; Recipe Master stage times are reused where available while the resolved total Process Time remains authoritative.
 
 Upgrade from v018: run only `db/32_painting_segmented_v019.sql` (4 statements). Optional verification: `db/verify_v019_painting.sql` (6 queries).
+
+## v021 — Full Route Dependency Graph + Smart Batch Split
+
+See `README_v021.md`. OUT-41 now exposes Job-level batch dependencies and may trial-split proposed batches for target recovery, with full finite-capacity re-simulation before the split is accepted.
