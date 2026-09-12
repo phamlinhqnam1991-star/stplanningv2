@@ -119,6 +119,18 @@ export type BackwardTargetModel = {
   includeAreaRollup: boolean;
 };
 
+export type WhatIfOptimizerModel = {
+  enabled: boolean;
+  maxAutoTrials: number;
+  cutoffExtensionsMinutes: number[];
+  chemicalConcurrencyBoost: number;
+  laborBoost: number;
+  tryCutoffExtension: boolean;
+  tryChemicalConcurrency: boolean;
+  tryMaskingLabor: boolean;
+  tryUnmaskingLabor: boolean;
+};
+
 export type CapacityModel = {
   resources: Record<string, CapacityResourceDefinition>;
   resourceList: CapacityResourceDefinition[];
@@ -138,6 +150,7 @@ export type CapacityModel = {
   smartBatchSplit: SmartBatchSplitModel;
   criticalPathRecovery: CriticalPathRecoveryModel;
   backwardTarget: BackwardTargetModel;
+  whatIfOptimizer: WhatIfOptimizerModel;
   chemicalLine: ChemicalLineCapacityModel;
   painting: PaintingCapacityModel;
   manualWork: ManualWorkCapacityModel;
@@ -182,6 +195,17 @@ export async function getCapacityModel(): Promise<CapacityModel> {
     backwardTarget: {
       enabled: true, reservePct: 0, plannedFirst: true, portfolioSort: "EARLIEST_FINISH",
       maxPortfolioJobs: 500, includeAreaRollup: true,
+    },
+    whatIfOptimizer: {
+      enabled: true,
+      maxAutoTrials: 6,
+      cutoffExtensionsMinutes: [60,120],
+      chemicalConcurrencyBoost: 1,
+      laborBoost: 1,
+      tryCutoffExtension: true,
+      tryChemicalConcurrency: true,
+      tryMaskingLabor: true,
+      tryUnmaskingLabor: true,
     },
     chemicalLine: {
       enabled: true, resourceCode: "FLYBAR", processMaxConcurrent: 3, ndtRecipeNos: ["001","009","016","025"],
@@ -304,6 +328,19 @@ export async function getCapacityModel(): Promise<CapacityModel> {
         portfolioSort: key(settings["capacity.backwardTargetPortfolioSort"]) === "HIGHEST_SURFACE" ? "HIGHEST_SURFACE" : "EARLIEST_FINISH",
         maxPortfolioJobs: Math.max(1, Math.min(2000, Math.trunc(num(settings["capacity.backwardTargetMaxPortfolioJobs"], defaults.backwardTarget.maxPortfolioJobs)))),
         includeAreaRollup: bool(settings["capacity.backwardTargetAreaRollup"], defaults.backwardTarget.includeAreaRollup),
+      },
+      whatIfOptimizer: {
+        enabled: bool(settings["capacity.whatIfEnabled"], defaults.whatIfOptimizer.enabled),
+        maxAutoTrials: Math.max(1, Math.min(12, Math.trunc(num(settings["capacity.whatIfMaxAutoTrials"], defaults.whatIfOptimizer.maxAutoTrials)))),
+        cutoffExtensionsMinutes: Array.isArray(settings["capacity.whatIfCutoffExtensionsMinutes"])
+          ? (settings["capacity.whatIfCutoffExtensionsMinutes"] as unknown[]).map((x) => Math.max(0, Math.min(720, Math.trunc(num(x,0))))).filter((x) => x > 0)
+          : defaults.whatIfOptimizer.cutoffExtensionsMinutes,
+        chemicalConcurrencyBoost: Math.max(0, Math.min(6, Math.trunc(num(settings["capacity.whatIfChemicalConcurrencyBoost"], defaults.whatIfOptimizer.chemicalConcurrencyBoost)))),
+        laborBoost: Math.max(0, Math.min(10, Math.trunc(num(settings["capacity.whatIfLaborBoost"], defaults.whatIfOptimizer.laborBoost)))),
+        tryCutoffExtension: bool(settings["capacity.whatIfTryCutoffExtension"], defaults.whatIfOptimizer.tryCutoffExtension),
+        tryChemicalConcurrency: bool(settings["capacity.whatIfTryChemicalConcurrency"], defaults.whatIfOptimizer.tryChemicalConcurrency),
+        tryMaskingLabor: bool(settings["capacity.whatIfTryMaskingLabor"], defaults.whatIfOptimizer.tryMaskingLabor),
+        tryUnmaskingLabor: bool(settings["capacity.whatIfTryUnmaskingLabor"], defaults.whatIfOptimizer.tryUnmaskingLabor),
       },
       chemicalLine: {
         enabled: bool(settings["capacity.chemicalLineSegmented"], defaults.chemicalLine.enabled),

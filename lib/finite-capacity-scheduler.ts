@@ -5,6 +5,7 @@ import { getCapacityModel, capacityInstanceCodes, capacityResource, type Capacit
 import { getPlanningModel, type MainOperationDefinition, type PlanningModel } from "@/lib/planning-model";
 import { calculateStOutputTarget, type StOutputJobAssessment, type StOutputStep } from "@/lib/st-output-engine";
 import { getRecipeModel, type RecipeModel } from "@/lib/recipe-model";
+import { applyCapacityScenario, type CapacityScenarioOverride } from "@/lib/capacity-scenario";
 
 export type FiniteCapacityOptions = {
   targetDate: string;
@@ -539,6 +540,18 @@ async function loadExistingOccupancy(model:CapacityModel,startAt:number,horizonE
     state.intervals.push({id:`S:${x.id}:${resourceCode}`,batchRef:String(x.batch_ref||""),sourceKind:"EXISTING_SCHEDULE",baseResourceCode:inf.base,resourceInstance:instance,recipeNo:x.recipe_no==null?null:String(x.recipe_no),start,end,status:String(x.status||""),mainOperationCode:null,jobs:[],surfaceDm2:0,segmentKind:"BLOCK",segmentLabel:"Existing Schedule",occupiesCapacity:true});
   }
   return state;
+}
+
+function applyScenarioOutages(state:OccupancyState,model:CapacityModel,scenario:CapacityScenarioOverride|null|undefined,startAt:number,horizonEnd:number):void{
+  const disabled=[...new Set((scenario?.disabledResourceInstances||[]).map((x)=>String(x).trim()).filter(Boolean))];
+  for(const code of disabled){
+    const inf=inferBaseResource(code,model);
+    const exactBase=key(code)===key(inf.base);
+    const instances=exactBase&&inf.def.instanceCount>1?capacityInstanceCodes(inf.def):[inf.instance||inf.base];
+    for(const instance of instances){
+      state.intervals.push({id:`WHATIF_OUTAGE:${inf.base}:${instance}`,batchRef:"WHAT_IF_OUTAGE",sourceKind:"EXISTING_SCHEDULE",baseResourceCode:inf.base,resourceInstance:instance,recipeNo:null,start:startAt,end:horizonEnd,status:"SCENARIO_OUTAGE",mainOperationCode:null,jobs:[],surfaceDm2:0,segmentKind:"BLOCK",segmentLabel:"What-if Resource Outage",occupiesCapacity:true,capacityUnits:1});
+    }
+  }
 }
 
 function timeMinutes(value:string|null, fallback:number):number{
@@ -1331,11 +1344,12 @@ function buildBackwardTargetPlan(
   return empty;
 }
 
-export async function calculateFiniteCapacityTarget(options:FiniteCapacityOptions):Promise<FiniteCapacityResult>{
-  const [base,planningModel,batchModel,capacityModel,recipeModel,bootstrap]=await Promise.all([
+export async function calculateFiniteCapacityTarget(options:FiniteCapacityOptions,scenario:CapacityScenarioOverride|null=null):Promise<FiniteCapacityResult>{
+  const [base,planningModel,batchModel,baseCapacityModel,recipeModel,bootstrap]=await Promise.all([
     calculateStOutputTarget({targetDate:options.targetDate,cutoffTime:options.cutoffTime,targetValue:options.targetValue}),
     getPlanningModel(),getBatchModel(),getCapacityModel(),getRecipeModel(),getConfigBootstrap(),
   ]);
+  const capacityModel=applyCapacityScenario(baseCapacityModel,scenario);
   const cutoff=wallDateTime(options.targetDate,options.cutoffTime);
   const routeSnapshot=parseWall(base.routeSnapshotAt);
   const configuredStart=wallDateTime(addDays(options.targetDate,-capacityModel.lookbackDays),capacityModel.scenarioStartTime);
@@ -1350,6 +1364,7 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
   const planningProfile=bootstrap.sources.PLANNING;
   const rawMap=await loadRawContexts(ids,planningProfile.sheetName||planningProfile.displayName);
   const existing=await loadExistingOccupancy(capacityModel,scenarioStart,horizonEnd);
+  applyScenarioOutages(existing,capacityModel,scenario,scenarioStart,horizonEnd);
   let sim:Simulation|null=null;let iteration=0;let cursor=0;
   while(iteration++<8){
     const selectedRows=potential.filter(x=>selected.has(x.planningJobId));const capacityRows=[...plannedRows,...selectedRows];
@@ -1396,6 +1411,13 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
   const splitBatchCount=publicBatches.filter(x=>x.smartSplitApplied).length;
   if(splitBatchCount&&!splitSourceBatchCount)splitSourceBatchCount=new Set(publicBatches.filter(x=>x.smartSplitApplied&&x.splitParentKey).map(x=>x.splitParentKey!)).size;
   const warnings=[...new Set(sim.warnings)];
+  if(scenario){
+    warnings.push("WHAT_IF_SCENARIO_ACTIVE");
+    if(scenario.disabledResourceInstances?.length)warnings.push(`WHAT_IF_DISABLED_RESOURCES:${scenario.disabledResourceInstances.join(",")}`);
+    if(scenario.chemicalProcessMaxConcurrent!=null)warnings.push(`WHAT_IF_CHEMICAL_PROCESS_CONCURRENCY:${capacityModel.chemicalLine.processMaxConcurrent}`);
+    if(scenario.maskingOperators!=null)warnings.push(`WHAT_IF_MASKING_OPERATORS:${scenario.maskingOperators}`);
+    if(scenario.unmaskingOperators!=null)warnings.push(`WHAT_IF_UNMASKING_OPERATORS:${scenario.unmaskingOperators}`);
+  }
   if(splitBatchCount)warnings.push(`SMART_BATCH_SPLIT_BATCHES:${splitBatchCount}`,`SMART_BATCH_SPLIT_RECOVERED_DM2:${Math.round(splitRecoveredSurface)}`);
   if(criticalPaths.length)warnings.push(`CRITICAL_PATH_JOBS:${criticalPaths.length}`);
   if(bottlenecks.length)warnings.push(`CAPACITY_BOTTLENECKS:${bottlenecks.length}`);

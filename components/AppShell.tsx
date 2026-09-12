@@ -46,8 +46,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v016</strong>
-            <small>Finite Capacity Target Scheduler</small>
+            <strong>Clean Rebuild v024</strong>
+            <small>What-if Target Optimizer</small>
           </div>
         </div>
       </aside>

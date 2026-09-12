@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiJson } from "@/lib/api-client";
 import { FiniteCapacityPanel } from "@/components/FiniteCapacityPanel";
+import { WhatIfOptimizerPanel } from "@/components/WhatIfOptimizerPanel";
 
 type Step = {
   routePosition:number; operationCode:string; operationSequence:number|null;
@@ -83,6 +84,8 @@ export function StOutputWorkbench(){
     </section>
 
     <FiniteCapacityPanel targetDate={targetDate} cutoffTime={cutoffTime} targetValue={Math.max(0,Number(targetValue)||0)} />
+
+    <WhatIfOptimizerPanel targetDate={targetDate} cutoffTime={cutoffTime} targetValue={Math.max(0,Number(targetValue)||0)} />
 
     <section className="panel">
       <div className="panel-head"><div><span className="eyebrow">BACKWARD REQUIREMENT</span><h2>Recommended Plan by Area / Operation / Recipe</h2></div><span className="record-count"><strong>{data?.actionGroups.length||0}</strong> action groups</span></div>
