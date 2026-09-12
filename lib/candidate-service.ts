@@ -1,6 +1,8 @@
 import { query } from "@/lib/db";
 import { getConfigBootstrap, routeConfigOptionsFromSettings, sourceDisplayColumns } from "@/lib/config";
-import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
+import type { RouteOperationForAnalysis } from "@/lib/route-analysis";
+import { currentPlanningJobsSource } from "@/lib/current-job-read-model";
+import { resolveErpState } from "@/lib/erp-state-kernel";
 import { classifyOperationRoute, getPlanningModel } from "@/lib/planning-model";
 import { getRecipeModel, resolveProcessTime, resolveRecipe } from "@/lib/recipe-model";
 import { getBatchModel, resolveBatchProposal, type BatchModel } from "@/lib/batch-model";
@@ -19,6 +21,9 @@ export type CandidateRow = {
   nextOperation: string | null;
   nextStOperation: string | null;
   routePosition: number | null;
+  routeOccurrenceKey: string | null;
+  routeAnchorConfidence: "HIGH" | "MEDIUM" | "LOW" | "NONE";
+  routeWarnings: string[];
   routeOperationCount: number | null;
   nextPlanningOperation: ReturnType<typeof classifyOperationRoute>["nextPlanningOperation"];
   recipeSuggestion: ReturnType<typeof resolveRecipe>;
@@ -67,16 +72,16 @@ export async function loadCandidateRows(options: LoadOptions = {}): Promise<Cand
 
   const rows = await query(`
     SELECT p.id, p.source_row_no, p.program, p.part_cluster, p.epicor_part, p.part_description,
-           p.job_num, p.next_operation, p.prod_qty, p.surface_dm2, p.all_operation,
+           p.job_num, p.last_labor_op, p.next_operation, p.prod_qty, p.surface_dm2, p.all_operation,
            rr.row_data AS raw_row_data,
            rr.row_data->'${revisionColumn}'->>'v' AS revision_num,
-           route.route_id, route.route_next_operation, route.route_operation_count,
+           route.route_id, route.route_next_operation, route.route_last_labor_op, route.route_last_labor_opr_seq, route.route_operation_count,
            COALESCE(route.route_operations,'[]'::jsonb) AS route_operations
-    FROM v_active_planning_jobs p
+    FROM ${currentPlanningJobsSource("p")}
     LEFT JOIN raw_sheet_rows rr
       ON rr.import_id=p.import_id AND rr.sheet_name=$1 AND rr.source_row_no=p.source_row_no
     LEFT JOIN LATERAL (
-      SELECT jr.id AS route_id, jr.next_operation AS route_next_operation, jr.operation_count AS route_operation_count,
+      SELECT jr.id AS route_id, jr.next_operation AS route_next_operation, jr.last_labor_op AS route_last_labor_op, jr.last_labor_opr_seq AS route_last_labor_opr_seq, jr.operation_count AS route_operation_count,
              COALESCE((
                SELECT jsonb_agg(jsonb_build_object(
                  'position', ro.operation_position,
@@ -90,7 +95,7 @@ export async function loadCandidateRows(options: LoadOptions = {}): Promise<Cand
              ), '[]'::jsonb) AS route_operations
       FROM v_active_job_routes jr
       WHERE jr.job_num=p.job_num
-      ORDER BY jr.source_row_no
+      ORDER BY jr.source_row_no DESC, jr.id DESC
       LIMIT 1
     ) route ON true
     ${whereSql}
@@ -102,9 +107,20 @@ export async function loadCandidateRows(options: LoadOptions = {}): Promise<Cand
   const out: CandidateRow[] = [];
   for (const row of rows.rows as Record<string, unknown>[]) {
     const routeOperations = (row.route_operations || []) as RouteOperationForAnalysis[];
-    const routeAnalysis = row.route_id
-      ? analyzeRoute(routeOperations, (row.route_next_operation as string | null) || (row.next_operation as string | null), row.all_operation as string | null, routeOptions)
+    const erpState = row.route_id
+      ? resolveErpState({
+          jobNum: String(row.job_num || ""),
+          operations: routeOperations,
+          allOperation: row.all_operation as string | null,
+          evidence: {
+            nextOperation: (row.route_next_operation as string | null) || (row.next_operation as string | null),
+            lastLaborOp: (row.route_last_labor_op as string | null) || (row.last_labor_op as string | null),
+            lastLaborSequence: row.route_last_labor_opr_seq == null ? null : Number(row.route_last_labor_opr_seq),
+          },
+          routeOptions,
+        })
       : null;
+    const routeAnalysis = erpState?.route || null;
     const planningClassification = routeAnalysis
       ? classifyOperationRoute(routeAnalysis.remainingStRoute.map((op) => op.code), planningModel)
       : null;
@@ -135,7 +151,11 @@ export async function loadCandidateRows(options: LoadOptions = {}): Promise<Cand
       description: row.part_description as string | null,
       qty: row.prod_qty == null ? null : Number(row.prod_qty), surfaceDm2: row.surface_dm2 == null ? null : Number(row.surface_dm2),
       nextOperation: row.next_operation as string | null, nextStOperation: routeAnalysis?.nextStOperation || null,
-      routePosition: routeAnalysis?.currentPosition || null, routeOperationCount: row.route_operation_count == null ? null : Number(row.route_operation_count),
+      routePosition: routeAnalysis?.currentPosition || null,
+      routeOccurrenceKey: routeAnalysis?.currentOccurrenceKey || null,
+      routeAnchorConfidence: routeAnalysis?.anchorConfidence || "NONE",
+      routeWarnings: routeAnalysis?.anchorWarnings || [],
+      routeOperationCount: row.route_operation_count == null ? null : Number(row.route_operation_count),
       nextPlanningOperation: nextPlanning, recipeSuggestion: recipe, processTimeSuggestion: processTime, batchProposal: proposal,
     });
   }

@@ -1,7 +1,8 @@
 import { getConfigBootstrap } from "@/lib/config";
 import { getPlanningModel, type MainOperationDefinition, type PlanningModel } from "@/lib/planning-model";
 import { getRecipeModel, resolveProcessTime, resolveRecipe, type ProcessTimeSuggestion, type RecipeModel, type RecipeSuggestion } from "@/lib/recipe-model";
-import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
+import { type RouteOperationForAnalysis } from "@/lib/route-analysis";
+import { resolveErpState } from "@/lib/erp-state-kernel";
 import { getStOutputModel, type StOutputModel } from "@/lib/st-output-model";
 import {
   loadStOutputTargetData,
@@ -341,9 +342,19 @@ function assessJob(
   const snapshotWall = wallFromTimestamp(row.route_snapshot_at as string | null, outputModel.timezoneOffsetMinutes);
   const cutoffWall = wallDateTime(targetDate, cutoffTime);
   const sorted = [...operations].filter((x)=>x.code).sort((a,b)=>a.position-b.position);
-  const route = analyzeRoute(sorted, (row.route_next_operation as string | null) || (row.next_operation as string | null), row.all_operation as string | null, {
-    preferNextOperation:true, fallbackFirstIncomplete:true, includeCurrentInRemaining:true,
+  const erpState = resolveErpState({
+    jobNum: String(row.job_num || ""),
+    operations: sorted,
+    allOperation: row.all_operation as string | null,
+    evidence: {
+      nextOperation: (row.route_next_operation as string | null) || (row.next_operation as string | null),
+      lastLaborOp: (row.route_last_labor_op as string | null) || (row.last_labor_op as string | null),
+      lastLaborSequence: row.route_last_labor_opr_seq == null ? null : Number(row.route_last_labor_opr_seq),
+    },
+    finalGateCodes: outputModel.finalInspectionOperationCodes,
+    routeOptions: { preferNextOperation:true, fallbackFirstIncomplete:true, includeCurrentInRemaining:true },
   });
+  const route = erpState.route;
   const currentIndex = route.currentPosition == null ? -1 : sorted.findIndex((x)=>x.position===route.currentPosition);
   const { endpoint, endpointIndex } = resolveApplicableFinalGate(
     sorted,
@@ -352,7 +363,7 @@ function assessJob(
   );
   const gateOccurrence = endpointIndex >= 0 ? finalGateOccurrence(sorted, endpointIndex) : null;
   const routeSig = routeSignature(sorted);
-  const warnings: string[] = [];
+  const warnings: string[] = [...route.anchorWarnings];
   const sourceSurface = Number(row.surface_dm2 || 0) || 0;
   const prodQty = Number(row.prod_qty || 0) || 0;
   const goodWipQty = Number(row.current_good_wip_qty || 0) || 0;

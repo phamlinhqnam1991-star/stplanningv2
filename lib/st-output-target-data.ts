@@ -1,5 +1,6 @@
 import { query } from "@/lib/db";
 import type { RouteOperationForAnalysis } from "@/lib/route-analysis";
+import { currentPlanningJobsSource } from "@/lib/current-job-read-model";
 
 export type StOutputSourceJobRow = Record<string, unknown>;
 
@@ -83,13 +84,15 @@ export async function loadStOutputTargetData(
       p.current_good_wip_qty,
       p.surface_dm2,
       p.all_operation,
+      p.current_job_duplicate_count,
       rr.row_data AS raw_row_data,
       jr.id AS route_id,
       jr.next_operation AS route_next_operation,
       jr.last_labor_op AS route_last_labor_op,
+      jr.last_labor_opr_seq AS route_last_labor_opr_seq,
       jr.revision_num AS route_revision_num,
       COALESCE(ri.completed_at,ri.imported_at) AS route_snapshot_at
-    FROM v_active_planning_jobs p
+    FROM ${currentPlanningJobsSource("p")}
     LEFT JOIN raw_sheet_rows rr
       ON rr.import_id=p.import_id
      AND rr.sheet_name=$1
@@ -115,6 +118,7 @@ export async function loadStOutputTargetData(
   for (const raw of base.rows as StOutputSourceJobRow[]) {
     const jobNum = text(raw.job_num);
     if (!jobNum) continue;
+    if (Number(raw.current_job_duplicate_count || 0) > 1) duplicateSet.add(jobNum);
     const previous = rowByJob.get(jobNum);
     if (!previous) {
       rowByJob.set(jobNum, raw);

@@ -16,7 +16,11 @@ type RouteAnalysis = {
   currentPosition: number | null;
   currentSequence: number | null;
   currentOperation: string | null;
-  positionSource: "NEXT_OPERATION" | "FIRST_INCOMPLETE" | "COMPLETE" | "NO_ROUTE";
+  currentOccurrence: number | null;
+  currentOccurrenceKey: string | null;
+  positionSource: "LAST_OPERATION_NEXT_PAIR" | "LAST_LABOR_NEXT_PAIR" | "LAST_LABOR_SEQUENCE" | "NEXT_OPERATION" | "FIRST_INCOMPLETE" | "COMPLETE" | "NO_ROUTE";
+  anchorConfidence: "HIGH" | "MEDIUM" | "LOW" | "NONE";
+  anchorWarnings: string[];
   remainingCount: number;
   stScopeAvailable: boolean;
   remainingStCount: number;
@@ -27,6 +31,7 @@ type RouteAnalysis = {
 type PlanningRow = {
   id: string;
   source_row_no: number;
+  current_job_duplicate_count?: number;
   program: string | null;
   part_cluster: string | null;
   epicor_part: string | null;
@@ -53,6 +58,13 @@ type PlanningRow = {
   route_id: string | null;
   route_operation_count: number | null;
   routeAnalysis: RouteAnalysis | null;
+  erpState: {
+    finalGateState: "BEFORE_FINAL" | "REACHED_FINAL" | "AFTER_FINAL" | "UNKNOWN";
+    finalGateCode: string | null;
+    finalGatePosition: number | null;
+    finalGateOccurrence: number | null;
+    reasons: Array<{ code: string; severity: "INFO" | "WARNING" | "BLOCKING"; message: string }>;
+  } | null;
   nextMainOperation: { code: string; label: string } | null;
   remainingMainOperations: Array<{ code: string; label: string; sourceOperation: string }>;
   nextPlanningOperation: MainPlanningDefinition | null;
@@ -298,7 +310,7 @@ export function PlanningTable() {
       case "job": return row.job_num ? <a className="mono route-link" href={`/routing?search=${encodeURIComponent(row.job_num)}`}>{row.job_num}</a> : <span className="mono">—</span>;
       case "nextOp": return <span className="op-chip">{row.next_operation || "—"}</span>;
       case "lastOp": return row.last_labor_op || "—";
-      case "routePos": return row.routeAnalysis ? <span className="route-position-badge" title={row.routeAnalysis.positionSource.replaceAll("_", " ")}>{row.routeAnalysis.currentPosition ? `${row.routeAnalysis.currentPosition}/${row.route_operation_count || "?"}` : "COMPLETE"}</span> : <span className="muted">No route</span>;
+      case "routePos": return row.routeAnalysis ? <div className="hierarchy-cell"><span className="route-position-badge" title={`${row.routeAnalysis.positionSource.replaceAll("_", " ")} · confidence ${row.routeAnalysis.anchorConfidence}${row.routeAnalysis.anchorWarnings.length ? ` · ${row.routeAnalysis.anchorWarnings.join(", ")}` : ""}`}>{row.routeAnalysis.currentPosition ? `${row.routeAnalysis.currentPosition}/${row.route_operation_count || "?"}` : "COMPLETE"}</span><small>{row.routeAnalysis.currentOccurrenceKey || row.routeAnalysis.anchorConfidence}</small></div> : <span className="muted">No route</span>;
       case "nextSt": return row.routeAnalysis?.nextStOperation ? <span className="next-st-badge" title={row.routeAnalysis.nextStSequence != null ? `OprSeq ${row.routeAnalysis.nextStSequence}` : undefined}>{row.routeAnalysis.nextStOperation}</span> : <span className="muted">—</span>;
       case "nextMain": return row.nextMainOperation ? <span className="main-op-badge" title={`Mapped from ${row.routeAnalysis?.nextStOperation || "ST operation"}`}>{row.nextMainOperation.label}</span> : <span className="muted">Unmapped</span>;
       case "nextPlan": return row.nextPlanningOperation ? <span className="planning-op-badge" style={row.nextPlanningOperation.color ? { borderColor: row.nextPlanningOperation.color } : undefined} title={`Planning order ${row.nextPlanningOperation.planningOrder}`}>{row.nextPlanningOperation.label}<small>{row.nextPlanningOperation.code}</small></span> : <span className="muted">No mapped planning step</span>;

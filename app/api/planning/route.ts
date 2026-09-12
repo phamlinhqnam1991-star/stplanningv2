@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
-import { analyzeRoute, type RouteOperationForAnalysis } from "@/lib/route-analysis";
+import type { RouteOperationForAnalysis } from "@/lib/route-analysis";
+import { currentPlanningJobsSource } from "@/lib/current-job-read-model";
+import { resolveErpState } from "@/lib/erp-state-kernel";
 import { getConfigBootstrap, numberSetting, routeConfigOptionsFromSettings, sourceDisplayColumns } from "@/lib/config";
 import { classifyOperationRoute, getPlanningModel } from "@/lib/planning-model";
 import { getRecipeModel, resolveProcessTime, resolveRecipe } from "@/lib/recipe-model";
@@ -92,7 +94,7 @@ export async function GET(request: Request) {
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
     const fromSql = `
-      FROM v_active_planning_jobs p
+      FROM ${currentPlanningJobsSource("p")}
       LEFT JOIN raw_sheet_rows rr
         ON rr.import_id = p.import_id
        AND rr.sheet_name = $1
@@ -123,7 +125,7 @@ export async function GET(request: Request) {
     const limitParam = `$${rowParams.length - 1}`;
     const offsetParam = `$${rowParams.length}`;
     const rows = await query(
-      `SELECT p.id, p.source_row_no, p.program, p.part_cluster, p.epicor_part,
+      `SELECT p.id, p.source_row_no, p.current_job_duplicate_count, p.program, p.part_cluster, p.epicor_part,
               p.surface_dm2, p.part_description, p.job_num, p.last_labor_op,
               p.next_operation, p.last_labor_qty, p.prod_qty, p.current_good_wip_qty,
               p.st_source_value, p.st_wip_area, p.wip_sequence, p.all_operation,
@@ -136,7 +138,7 @@ export async function GET(request: Request) {
               rr.row_data AS raw_row_data,
               COALESCE(op.operation_count,0)::int AS operation_count,
               COALESCE(op.operations,'[]'::jsonb) AS operations,
-              route.route_id, route.route_next_operation, route.route_operation_count,
+              route.route_id, route.route_next_operation, route.route_last_labor_op, route.route_last_labor_opr_seq, route.route_operation_count,
               COALESCE(route.route_operations,'[]'::jsonb) AS route_operations
        ${fromSql}
        LEFT JOIN LATERAL (
@@ -155,6 +157,8 @@ export async function GET(request: Request) {
        LEFT JOIN LATERAL (
          SELECT jr.id AS route_id,
                 jr.next_operation AS route_next_operation,
+                jr.last_labor_op AS route_last_labor_op,
+                jr.last_labor_opr_seq AS route_last_labor_opr_seq,
                 jr.operation_count AS route_operation_count,
                 COALESCE((
                   SELECT jsonb_agg(
@@ -172,7 +176,7 @@ export async function GET(request: Request) {
                 ), '[]'::jsonb) AS route_operations
          FROM v_active_job_routes jr
          WHERE jr.job_num=p.job_num
-         ORDER BY jr.source_row_no
+         ORDER BY jr.source_row_no DESC, jr.id DESC
          LIMIT 1
        ) route ON true
        ${whereSql}
@@ -183,9 +187,20 @@ export async function GET(request: Request) {
 
     const analyzedRows = rows.rows.map((row: Record<string, unknown>) => {
       const routeOperations = (row.route_operations || []) as RouteOperationForAnalysis[];
-      const routeAnalysis = row.route_id
-        ? analyzeRoute(routeOperations, (row.route_next_operation as string | null) || (row.next_operation as string | null), row.all_operation as string | null, routeOptions)
+      const erpState = row.route_id
+        ? resolveErpState({
+            jobNum: String(row.job_num || ""),
+            operations: routeOperations,
+            allOperation: row.all_operation as string | null,
+            evidence: {
+              nextOperation: (row.route_next_operation as string | null) || (row.next_operation as string | null),
+              lastLaborOp: (row.route_last_labor_op as string | null) || (row.last_labor_op as string | null),
+              lastLaborSequence: row.route_last_labor_opr_seq == null ? null : Number(row.route_last_labor_opr_seq),
+            },
+            routeOptions,
+          })
         : null;
+      const routeAnalysis = erpState?.route || null;
       const planningClassification = routeAnalysis
         ? classifyOperationRoute(routeAnalysis.remainingStRoute.map((op) => op.code), planningModel)
         : null;
@@ -209,6 +224,13 @@ export async function GET(request: Request) {
       return {
         ...publicRow,
         routeAnalysis,
+        erpState: erpState ? {
+          finalGateState: erpState.finalGateState,
+          finalGateCode: erpState.finalGateCode,
+          finalGatePosition: erpState.finalGatePosition,
+          finalGateOccurrence: erpState.finalGateOccurrence,
+          reasons: erpState.reasons,
+        } : null,
         planningClassification,
         nextMainOperation: nextMain ? { code: nextMain.code, label: nextMain.label } : null,
         nextPlanningOperation: nextPlanning,

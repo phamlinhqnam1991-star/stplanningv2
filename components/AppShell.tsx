@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { PRODUCT_META } from "@/lib/product-meta";
 
 const nav = [
   { href: "/", code: "SYS-00", label: "Overview" },
@@ -46,8 +47,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           <span className="status-dot" />
           <div>
-            <strong>Clean Rebuild v024</strong>
-            <small>What-if Target Optimizer</small>
+            <strong>{PRODUCT_META.version}</strong>
+            <small>{PRODUCT_META.releaseLabel}</small>
           </div>
         </div>
       </aside>

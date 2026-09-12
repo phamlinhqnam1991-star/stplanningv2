@@ -23,7 +23,11 @@ type RouteAnalysis = {
   currentPosition: number | null;
   currentSequence: number | null;
   currentOperation: string | null;
-  positionSource: "NEXT_OPERATION" | "FIRST_INCOMPLETE" | "COMPLETE" | "NO_ROUTE";
+  currentOccurrence: number | null;
+  currentOccurrenceKey: string | null;
+  positionSource: "LAST_OPERATION_NEXT_PAIR" | "LAST_LABOR_NEXT_PAIR" | "LAST_LABOR_SEQUENCE" | "NEXT_OPERATION" | "FIRST_INCOMPLETE" | "COMPLETE" | "NO_ROUTE";
+  anchorConfidence: "HIGH" | "MEDIUM" | "LOW" | "NONE";
+  anchorWarnings: string[];
   completedCount: number;
   remainingCount: number;
   remainingRoute: RouteOperation[];
@@ -38,6 +42,7 @@ type RouteAnalysis = {
 type RouteRow = {
   id: string;
   source_row_no: number;
+  current_route_duplicate_count?: number;
   program: string | null;
   epicor_part: string | null;
   revision_num: string | null;
@@ -52,6 +57,13 @@ type RouteRow = {
   st_all_operation: string | null;
   operations: RouteOperation[];
   routeAnalysis: RouteAnalysis;
+  erpState: {
+    finalGateState: "BEFORE_FINAL" | "REACHED_FINAL" | "AFTER_FINAL" | "UNKNOWN";
+    finalGateCode: string | null;
+    finalGatePosition: number | null;
+    finalGateOccurrence: number | null;
+    reasons: Array<{ code: string; severity: "INFO" | "WARNING" | "BLOCKING"; message: string }>;
+  };
   nextMainOperation: { code: string; label: string } | null;
   remainingMainOperations: Array<{ code: string; label: string; sourceOperation: string }>;
   nextPlanningOperation: MainPlanningDefinition | null;
@@ -135,10 +147,10 @@ export function RoutingExplorer() {
 
       <section className="panel route-engine-note">
         <div>
-          <span className="eyebrow">ROUTING ENGINE v1</span>
-          <strong>Current Position → Remaining Route → Remaining ST Route → Next ST Operation</strong>
+          <span className="eyebrow">ERP STATE KERNEL · v026.1</span>
+          <strong>Occurrence-aware Position → Remaining Physical Route → ST Route → Final Gate</strong>
         </div>
-        <p>Current Position is anchored to source <b>NextOperation</b>. ST scope is not hard-coded: it is taken from the active Planning row <b>AllOperation</b> for the same JobNum and intersected with the full All Open Jobs route.</p>
+        <p>Physical position now resolves by <b>Last + Next pair</b>, then Last Labor sequence, then Next Operation and finally first incomplete fallback. Repeated operations/rework receive occurrence identity such as PRIMER#2. All tabs use the same latest Job/Route read-model rule.</p>
       </section>
 
       <section className="panel">
@@ -161,15 +173,15 @@ export function RoutingExplorer() {
                 const a = row.routeAnalysis;
                 return (
                   <tr key={row.id}>
-                    <td className="route-job-cell"><strong>{row.job_num || "—"}</strong><span>Qty {row.prod_qty ?? "—"}</span><span>Rev {row.revision_num || "—"}</span></td>
+                    <td className="route-job-cell"><strong>{row.job_num || "—"}</strong><span>Qty {row.prod_qty ?? "—"}</span><span>Rev {row.revision_num || "—"}</span>{Number(row.current_route_duplicate_count || 0) > 1 ? <span title="ERP current read model kept only the newest active route row">SOURCE DUP ×{row.current_route_duplicate_count}</span> : null}</td>
                     <td><strong>{row.program || "—"}</strong><div className="muted-line">{row.epicor_part || "—"}</div></td>
                     <td><div className="state-stack"><span><b>LAST</b> {row.last_labor_op || "—"}</span><span><b>NEXT</b> {row.next_operation || "—"}</span><span><b>OPS</b> {row.operation_count}</span></div></td>
                     <td>
                       <div className="route-analysis-cell">
-                        <div className="route-analysis-line"><span>POSITION</span><strong>{a.currentPosition ? `${a.currentPosition}/${row.operation_count}` : "COMPLETE"}</strong><small>{a.positionSource.replaceAll("_", " ")}</small></div>
+                        <div className="route-analysis-line"><span>POSITION</span><strong>{a.currentPosition ? `${a.currentPosition}/${row.operation_count}` : "COMPLETE"}</strong><small>{a.currentOccurrenceKey || a.positionSource.replaceAll("_", " ")}</small><small>{a.anchorConfidence} confidence</small></div>
                         <div className="route-analysis-line"><span>REMAINING</span><strong>{a.remainingCount}</strong><small>operations</small></div>
                         <div className="route-analysis-line st"><span>REMAINING ST</span><strong>{a.stScopeAvailable ? a.remainingStCount : "—"}</strong><small>{a.stScopeAvailable ? "Planning scope" : "No Planning match"}</small></div>
-                        <div className="next-st-box"><span>NEXT ST</span><strong>{a.nextStOperation || "—"}</strong>{a.nextStSequence != null ? <small>Seq {a.nextStSequence}</small> : null}</div><div className="next-main-box"><span>NEXT MAIN</span><strong>{row.nextMainOperation?.label || "UNMAPPED"}</strong>{row.nextMainOperation ? <small>{row.nextMainOperation.code}</small> : null}</div><div className="next-planning-box"><span>NEXT PLANNING</span><strong>{row.nextPlanningOperation?.label || "—"}</strong>{row.nextPlanningOperation ? <small>Order {row.nextPlanningOperation.planningOrder} · {row.nextPlanningOperation.scheduleArea?.label || row.nextPlanningOperation.physicalArea?.label || "No area"}</small> : null}</div>
+                        <div className="next-st-box"><span>NEXT ST</span><strong>{a.nextStOperation || "—"}</strong>{a.nextStSequence != null ? <small>Seq {a.nextStSequence}</small> : null}</div><div className="next-main-box"><span>NEXT MAIN</span><strong>{row.nextMainOperation?.label || "UNMAPPED"}</strong>{row.nextMainOperation ? <small>{row.nextMainOperation.code}</small> : null}</div><div className="next-planning-box"><span>NEXT PLANNING</span><strong>{row.nextPlanningOperation?.label || "—"}</strong>{row.nextPlanningOperation ? <small>Order {row.nextPlanningOperation.planningOrder} · {row.nextPlanningOperation.scheduleArea?.label || row.nextPlanningOperation.physicalArea?.label || "No area"}</small> : null}</div><div className="next-st-box"><span>FINAL GATE</span><strong>{row.erpState.finalGateCode || "REVIEW"}</strong><small>{row.erpState.finalGateState}{row.erpState.finalGateOccurrence ? ` · #${row.erpState.finalGateOccurrence}` : ""}</small></div>
                         {row.unmappedStOperations?.length ? <div className="route-unmapped-strip"><b>UNMAPPED</b>{row.unmappedStOperations.map((op) => <span key={`unmapped-${row.id}-${op}`}>{op}</span>)}</div> : null}{a.remainingStRoute.length ? <div className="remaining-st-strip">{a.remainingStRoute.map((op) => <span key={`st-${row.id}-${op.position}`} title={`Position ${op.position} · Seq ${op.sequence ?? "—"}`}>{op.code}</span>)}</div> : null}{row.remainingMainOperations?.length ? <div className="remaining-main-strip">{row.remainingMainOperations.map((op) => <span key={`main-${row.id}-${op.code}`}>{op.label}</span>)}</div> : null}
                       </div>
                     </td>

@@ -40,7 +40,7 @@ export async function persistProductionSnapshot(args: {
 
 export interface ProposedPlacementInput {
   sourceMode: "EXISTING_UNSCHEDULED" | "NEW_PROPOSED";
-  existingBatchId?: number | null;
+  existingBatchId?: string | null;
   mainOperation: string;
   recipeId?: number | null;
   recipeNo?: string | null;
