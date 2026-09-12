@@ -150,6 +150,80 @@ export type CapacityResourceSummary = {
   lateOrUnscheduledBatches: number;
 };
 
+export type CapacityCriticalPathStep = {
+  batchNo: string;
+  mainOperationCode: string;
+  operationCode: string;
+  routePosition: number | null;
+  resourceBase: string | null;
+  resourceInstance: string | null;
+  startAt: string | null;
+  endAt: string | null;
+  elapsedMinutes: number | null;
+  routeLagMinutes: number;
+  batchGateWaitMinutes: number;
+  resourceWaitMinutes: number;
+  lateStartMinutes: number;
+  blockingGate: boolean;
+  status: ProposedCapacityBatch["status"];
+};
+
+export type CapacityCriticalPathJob = {
+  jobNum: string;
+  planningJobId: number;
+  surfaceDm2: number;
+  finiteStatus: CapacityJobResult["finiteStatus"];
+  finishAt: string | null;
+  cutoffAt: string;
+  lateByMinutes: number;
+  slackMinutes: number | null;
+  totalWaitMinutes: number;
+  totalElapsedMinutes: number | null;
+  criticalBatchNo: string | null;
+  criticalMainOperationCode: string | null;
+  steps: CapacityCriticalPathStep[];
+};
+
+export type CapacityBottleneck = {
+  rank: number;
+  type: "RESOURCE_WAIT" | "BATCH_GATE" | "NDT_SPACING" | "UNSCHEDULED" | "LATE_START";
+  key: string;
+  label: string;
+  resourceBase: string | null;
+  resourceInstance: string | null;
+  mainOperationCode: string | null;
+  delayMinutes: number;
+  totalDelayMinutes: number;
+  affectedJobCount: number;
+  affectedSurfaceDm2: number;
+  lostOutputDm2: number;
+  batchCount: number;
+  batches: string[];
+  jobs: string[];
+  blockingJobs: string[];
+  severityScore: number;
+  utilizationPct: number | null;
+  reason: string;
+};
+
+export type CapacityRecoveryOption = {
+  rank: number;
+  actionType: "SMART_SPLIT" | "PRIORITIZE_BATCH" | "PRIORITIZE_CRITICAL_CHAIN";
+  title: string;
+  batchNo: string | null;
+  jobNum: string | null;
+  mainOperationCode: string | null;
+  currentResource: string | null;
+  suggestedResource: string | null;
+  recoveredMinutes: number;
+  recoveredSurfaceDm2: number;
+  projectedForecastSurface: number;
+  projectedGap: number;
+  verifiedByResimulation: boolean;
+  result: "IMPROVES" | "NO_GAIN";
+  rationale: string;
+};
+
 export type FiniteCapacityResult = {
   targetDate: string;
   cutoffTime: string;
@@ -179,6 +253,10 @@ export type FiniteCapacityResult = {
     lateBatchCount: number;
     unscheduledBatchCount: number;
     capacityReviewJobCount: number;
+    criticalJobCount: number;
+    bottleneckCount: number;
+    recoveryOptionCount: number;
+    bestRecoverySurfaceDm2: number;
   };
   selectedJobNums: string[];
   finiteRecommendedJobNums: string[];
@@ -187,6 +265,9 @@ export type FiniteCapacityResult = {
   timeline: CapacityTimelineEntry[];
   resources: CapacityResourceSummary[];
   dependencies: CapacityDependencyEdge[];
+  criticalPaths: CapacityCriticalPathJob[];
+  bottlenecks: CapacityBottleneck[];
+  recoveryOptions: CapacityRecoveryOption[];
   warnings: string[];
 };
 
@@ -225,6 +306,7 @@ type BatchDependencyInternal = {
   readyAt: number | null;
 };
 type SplitAssignment = { partIndex: number; partCount: number; reason: string; parentGroupKey: string };
+type ScheduleTrial = { priorityNodeKeys?: Set<string> };
 
 type BatchNode = {
   id: string;
@@ -791,13 +873,22 @@ function applyBatchGateAudit(node:BatchNode,nodeMap:Map<string,BatchNode>,member
   }
 }
 
-function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:OccupancyState,capacityModel:CapacityModel,recipeModel:RecipeModel,scenarioStart:number,horizonEnd:number):OccupancyState{
+function trialNodeKey(node:BatchNode):string{
+  const jobs=node.members.map((m)=>m.row.planningJobId).sort((a,b)=>a-b).join(",");
+  return `${node.sourceGroupKey}|PART:${node.splitPartIndex??0}|MAIN:${key(node.mainOperation.code)}|J:${jobs}`;
+}
+
+function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:OccupancyState,capacityModel:CapacityModel,recipeModel:RecipeModel,scenarioStart:number,horizonEnd:number,trial:ScheduleTrial|null=null):OccupancyState{
   const state:OccupancyState={intervals:initial.intervals.map(x=>({...x,jobs:[...x.jobs]}))};const map=new Map(nodes.map(x=>[x.id,x]));const pending=new Set(nodes.map(x=>x.id));
   let proposalSeq=0;
   while(pending.size){
     const readyNodes=[...pending].map(id=>map.get(id)!).filter(node=>node.members.every(m=>!m.previousMemberKey||memberNode.get(m.previousMemberKey)===node.id||!pending.has(memberNode.get(m.previousMemberKey)||"")));
     if(!readyNodes.length){for(const id of pending){const x=map.get(id)!;x.status="DEPENDENCY_CONFLICT";x.reason="CYCLIC_OR_UNRESOLVED_DEPENDENCY";}break;}
-    readyNodes.sort((a,b)=>(a.mustStartBy??Number.POSITIVE_INFINITY)-(b.mustStartBy??Number.POSITIVE_INFINITY)||(a.sourceKind==="EXISTING_BATCH"?-1:1)-(b.sourceKind==="EXISTING_BATCH"?-1:1)||b.members.reduce((s,x)=>s+x.row.surfaceDm2,0)-a.members.reduce((s,x)=>s+x.row.surfaceDm2,0));
+    readyNodes.sort((a,b)=>{
+      const ap=trial?.priorityNodeKeys?.has(trialNodeKey(a))?0:1;
+      const bp=trial?.priorityNodeKeys?.has(trialNodeKey(b))?0:1;
+      return ap-bp||(a.mustStartBy??Number.POSITIVE_INFINITY)-(b.mustStartBy??Number.POSITIVE_INFINITY)||(a.sourceKind==="EXISTING_BATCH"?-1:1)-(b.sourceKind==="EXISTING_BATCH"?-1:1)||b.members.reduce((s,x)=>s+x.row.surfaceDm2,0)-a.members.reduce((s,x)=>s+x.row.surfaceDm2,0);
+    });
     const node=readyNodes[0];pending.delete(node.id);const dep=predecessorReady(node,map,memberNode,scenarioStart);applyBatchGateAudit(node,map,memberNode,capacityModel,dep.ready,scenarioStart);
     if(node.sourceKind==="FIXED_SCHEDULE"){
       node.start=node.fixedStart;node.end=node.fixedEnd;if(dep.conflict){node.status="DEPENDENCY_CONFLICT";node.reason="FIXED_SCHEDULE_STARTS_BEFORE_JOB_IS_READY";}else node.status="FIXED";
@@ -919,10 +1010,10 @@ function deriveSmartSplitAssignments(baseline:Simulation,capacityModel:CapacityM
   return out;
 }
 
-async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,rawMap:Map<number,RawContext>,planningModel:PlanningModel,batchModel:Awaited<ReturnType<typeof getBatchModel>>,capacityModel:CapacityModel,recipeModel:RecipeModel,baseOccupancy:OccupancyState,scenarioStart:number,cutoff:number,horizonEnd:number,splitAssignments:Map<string,SplitAssignment>|null=null):Promise<Simulation>{
+async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,rawMap:Map<number,RawContext>,planningModel:PlanningModel,batchModel:Awaited<ReturnType<typeof getBatchModel>>,capacityModel:CapacityModel,recipeModel:RecipeModel,baseOccupancy:OccupancyState,scenarioStart:number,cutoff:number,horizonEnd:number,splitAssignments:Map<string,SplitAssignment>|null=null,trial:ScheduleTrial|null=null):Promise<Simulation>{
   const chains=buildChains(rows,rawMap,planningModel,batchModel,capacityModel);
   const {nodes,memberNode}=buildNodes(chains,capacityModel,splitAssignments);
-  const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,recipeModel,scenarioStart,horizonEnd);
+  const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,recipeModel,scenarioStart,horizonEnd,trial);
   const dependencies=buildDependencyEdges(chains,nodes,memberNode,scenarioStart,capacityModel.dependencyGraphEnabled);
   const jobs=evaluateJobs(chains,nodes,memberNode,scenarioStart,cutoff);
   const feasiblePlannedSurface=jobs.filter(x=>x.sourceStatus==="PLANNED"&&x.contributes).reduce((sum,x)=>sum+x.surfaceDm2,0);
@@ -937,6 +1028,130 @@ async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,ra
   if(capacityModel.dependencyGraphEnabled&&dependencies.length)warnings.push(`FULL_ROUTE_DEPENDENCY_EDGES:${dependencies.length}`);
   if(nodes.some(x=>x.splitParentKey))warnings.push("SMART_BATCH_SPLIT_APPLIED");
   return{nodes,chains,memberNode,dependencies,jobs,timeline:timelineRows(state,capacityModel,scenarioStart,horizonEnd),resources:resourceSummary(state,nodes,capacityModel,scenarioStart,cutoff),feasiblePlannedSurface,feasibleCandidateSurface,selectedCandidateSurface,warnings};
+}
+
+
+type BottleneckAccumulator = {
+  type: CapacityBottleneck["type"];
+  key: string;
+  label: string;
+  resourceBase: string | null;
+  resourceInstance: string | null;
+  mainOperationCode: string | null;
+  delayMinutes: number;
+  totalDelayMinutes: number;
+  jobs: Set<string>;
+  lostJobs: Set<string>;
+  batches: Set<string>;
+  blockingJobs: Set<string>;
+  affectedSurfaceByJob: Map<string,number>;
+  lostSurfaceByJob: Map<string,number>;
+  utilizationPct: number | null;
+  reason: string;
+};
+
+function criticalPathAnalysis(sim:Simulation,cutoff:number,scenarioStart:number,capacityModel:CapacityModel):CapacityCriticalPathJob[]{
+  if(!capacityModel.criticalPathRecovery.enabled)return[];
+  const cfg=capacityModel.criticalPathRecovery;const nodeMap=new Map(sim.nodes.map((x)=>[x.id,x]));const jobMap=new Map(sim.jobs.map((x)=>[x.planningJobId,x]));
+  const rows:CapacityCriticalPathJob[]=[];
+  for(const chain of sim.chains){
+    const job=jobMap.get(chain.row.planningJobId);if(!job)continue;
+    const finish=parseWall(job.finishAt);const slack=finish==null?null:(cutoff-finish)/60_000;
+    const include=job.finiteStatus!=="ON_TIME"||(slack!=null&&slack<=cfg.nearCutoffMinutes);if(!include)continue;
+    const steps:CapacityCriticalPathStep[]=[];let totalWait=0;let criticalBatchNo:string|null=null;let criticalMain:string|null=null;let criticalScore=-1;
+    for(const member of chain.members){
+      const nodeId=sim.memberNode.get(member.key);const node=nodeId?nodeMap.get(nodeId):null;if(!node)continue;
+      const ownReady=memberRouteReadyAt(member,nodeMap,sim.memberNode,scenarioStart);
+      const gateWait=ownReady!=null&&node.batchReadyAt!=null?Math.max(0,(node.batchReadyAt-ownReady)/60_000):0;
+      const resourceWait=node.start!=null&&node.batchReadyAt!=null?Math.max(0,(node.start-node.batchReadyAt)/60_000):0;
+      const lateStart=node.start!=null&&node.mustStartBy!=null?Math.max(0,(node.start-node.mustStartBy)/60_000):0;
+      const elapsed=node.start!=null&&node.end!=null?Math.max(0,(node.end-node.start)/60_000):null;
+      const score=(node.status==="UNSCHEDULED"||node.status==="DEPENDENCY_CONFLICT"?1_000_000:0)+gateWait+resourceWait+lateStart;
+      if(score>criticalScore){criticalScore=score;criticalBatchNo=node.batchNo;criticalMain=node.mainOperation.code;}
+      totalWait+=gateWait+resourceWait;
+      steps.push({batchNo:node.batchNo,mainOperationCode:node.mainOperation.code,operationCode:member.step.operationCode,routePosition:member.step.routePosition??null,resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,startAt:wallIso(node.start),endAt:wallIso(node.end),elapsedMinutes:elapsed==null?null:Math.round(elapsed),routeLagMinutes:member.lagBeforeMinutes,batchGateWaitMinutes:Math.round(gateWait),resourceWaitMinutes:Math.round(resourceWait),lateStartMinutes:Math.round(lateStart),blockingGate:node.blockingJobs.includes(chain.row.jobNum),status:node.status});
+    }
+    const totalElapsed=finish==null?null:Math.max(0,(finish-scenarioStart)/60_000);
+    rows.push({jobNum:job.jobNum,planningJobId:job.planningJobId,surfaceDm2:job.surfaceDm2,finiteStatus:job.finiteStatus,finishAt:job.finishAt,cutoffAt:job.cutoffAt,lateByMinutes:finish==null?0:Math.max(0,Math.round((finish-cutoff)/60_000)),slackMinutes:slack==null?null:Math.round(slack),totalWaitMinutes:Math.round(totalWait),totalElapsedMinutes:totalElapsed==null?null:Math.round(totalElapsed),criticalBatchNo,criticalMainOperationCode:criticalMain,steps});
+  }
+  return rows.sort((a,b)=>b.lateByMinutes-a.lateByMinutes||(a.slackMinutes??-999999)-(b.slackMinutes??-999999)||b.totalWaitMinutes-a.totalWaitMinutes||b.surfaceDm2-a.surfaceDm2||a.jobNum.localeCompare(b.jobNum)).slice(0,50);
+}
+
+function bottleneckAnalysis(sim:Simulation,critical:CapacityCriticalPathJob[],capacityModel:CapacityModel,scenarioStart:number):CapacityBottleneck[]{
+  if(!capacityModel.criticalPathRecovery.enabled)return[];
+  const cfg=capacityModel.criticalPathRecovery;const minDelay=cfg.bottleneckMinDelayMinutes;const jobMap=new Map(sim.jobs.map((x)=>[x.jobNum,x]));const criticalJobs=new Set(critical.map((x)=>x.jobNum));const resourceMap=new Map(sim.resources.map((x)=>[key(x.baseResourceCode),x]));const acc=new Map<string,BottleneckAccumulator>();
+  const put=(type:CapacityBottleneck["type"],bucketKey:string,label:string,node:BatchNode,delay:number,reason:string,resourceBase:string|null=node.resourceBase,resourceInstance:string|null=node.resourceInstance)=>{
+    if(delay<minDelay&&type!=="UNSCHEDULED")return;
+    const memberJobs=[...new Set(node.members.map((m)=>m.row.jobNum))];const relevant=memberJobs.filter((j)=>{const r=jobMap.get(j);return Boolean(r)&&(!r!.contributes||criticalJobs.has(j));});if(!relevant.length)return;
+    const k=`${type}|${bucketKey}`;let a=acc.get(k);if(!a){a={type,key:k,label,resourceBase,resourceInstance,mainOperationCode:node.mainOperation.code,delayMinutes:0,totalDelayMinutes:0,jobs:new Set(),lostJobs:new Set(),batches:new Set(),blockingJobs:new Set(),affectedSurfaceByJob:new Map(),lostSurfaceByJob:new Map(),utilizationPct:resourceBase?(resourceMap.get(key(resourceBase))?.utilizationPct??null):null,reason};acc.set(k,a);}
+    a.delayMinutes=Math.max(a.delayMinutes,delay);a.totalDelayMinutes+=delay;a.batches.add(node.batchNo);for(const j of relevant){const r=jobMap.get(j)!;a.jobs.add(j);a.affectedSurfaceByJob.set(j,r.surfaceDm2);if(!r.contributes){a.lostJobs.add(j);a.lostSurfaceByJob.set(j,r.surfaceDm2);}}for(const j of node.blockingJobs)a.blockingJobs.add(j);
+  };
+  const nodeMap=new Map(sim.nodes.map((x)=>[x.id,x]));
+  for(const node of sim.nodes){
+    const memberReady=node.members.map((m)=>memberRouteReadyAt(m,nodeMap,sim.memberNode,scenarioStart)).filter((x):x is number=>x!=null&&Number.isFinite(x));
+    const minReady=memberReady.length?Math.min(...memberReady):node.batchReadyAt;const gateSpread=minReady!=null&&node.batchReadyAt!=null?Math.max(0,(node.batchReadyAt-minReady)/60_000):0;
+    const resourceWait=node.start!=null&&node.batchReadyAt!=null?Math.max(0,(node.start-node.batchReadyAt)/60_000):0;
+    const lateStart=node.start!=null&&node.mustStartBy!=null?Math.max(0,(node.start-node.mustStartBy)/60_000):0;
+    const ndtWait=node.segments.filter((x)=>x.kind==="WAIT_NDT").reduce((sum,x)=>sum+Math.max(0,(x.end-x.start)/60_000),0);
+    if(node.status==="UNSCHEDULED"||node.status==="DEPENDENCY_CONFLICT")put("UNSCHEDULED",key(node.mainOperation.code),`Unscheduled ${node.mainOperation.label}`,node,Math.max(minDelay,lateStart||minDelay),node.reason||"No feasible finite-capacity slot before the simulation horizon",node.resourceBase,node.resourceInstance);
+    if(gateSpread>0)put("BATCH_GATE",node.batchNo,`Batch readiness gate · ${node.batchNo}`,node,gateSpread,"One or more late member Jobs hold the entire batch until the last prerequisite route is ready",null,null);
+    if(resourceWait>0)put("RESOURCE_WAIT",key(node.resourceBase||node.mainOperation.code),`Resource wait · ${node.resourceBase||node.mainOperation.label}`,node,resourceWait,"Batch is route-ready but waits for finite resource capacity",node.resourceBase,node.resourceInstance);
+    if(ndtWait>0)put("NDT_SPACING",key(node.resourceBase||"FLYBAR"),"Chemical NDT start spacing",node,ndtWait,"Chemical Line process finished but NDT start spacing forces additional waiting",node.resourceBase,node.resourceInstance);
+    if(lateStart>0)put("LATE_START",key(node.mainOperation.code),`Late start · ${node.mainOperation.label}`,node,lateStart,"Batch starts after its backward-calculated latest start for the FINSST cutoff",node.resourceBase,node.resourceInstance);
+  }
+  const rows=[...acc.values()].map((a)=>{
+    const affectedSurface=[...a.affectedSurfaceByJob.values()].reduce((s,x)=>s+x,0);const lostSurface=[...a.lostSurfaceByJob.values()].reduce((s,x)=>s+x,0);const severity=a.totalDelayMinutes*Math.max(1,lostSurface||affectedSurface);
+    return{rank:0,type:a.type,key:a.key,label:a.label,resourceBase:a.resourceBase,resourceInstance:a.resourceInstance,mainOperationCode:a.mainOperationCode,delayMinutes:Math.round(a.delayMinutes),totalDelayMinutes:Math.round(a.totalDelayMinutes),affectedJobCount:a.jobs.size,affectedSurfaceDm2:affectedSurface,lostOutputDm2:lostSurface,batchCount:a.batches.size,batches:[...a.batches].sort(),jobs:[...a.jobs].sort(),blockingJobs:[...a.blockingJobs].sort(),severityScore:Math.round(severity),utilizationPct:a.utilizationPct,reason:a.reason};
+  }).sort((a,b)=>b.severityScore-a.severityScore||b.lostOutputDm2-a.lostOutputDm2||b.delayMinutes-a.delayMinutes).slice(0,cfg.bottleneckTopN);
+  return rows.map((x,i)=>({...x,rank:i+1}));
+}
+
+function simulationForecast(actual:number,committed:number,sim:Simulation):number{return actual+committed+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;}
+function finishImprovementMinutes(base:Simulation,trial:Simulation,jobs:Set<string>):number{
+  const trialMap=new Map(trial.jobs.map((x)=>[x.jobNum,x]));let best=0;
+  for(const row of base.jobs){if(!jobs.has(row.jobNum))continue;const t=trialMap.get(row.jobNum);const a=parseWall(row.finishAt),b=parseWall(t?.finishAt);if(a!=null&&b!=null&&b<a)best=Math.max(best,(a-b)/60_000);}
+  return Math.round(best);
+}
+
+type RecoveryTrialContext = {
+  capacityRows: StOutputJobAssessment[];
+  selected: Set<number>;
+  rawMap: Map<number,RawContext>;
+  planningModel: PlanningModel;
+  batchModel: Awaited<ReturnType<typeof getBatchModel>>;
+  capacityModel: CapacityModel;
+  recipeModel: RecipeModel;
+  existing: OccupancyState;
+  scenarioStart: number;
+  cutoff: number;
+  horizonEnd: number;
+  splitAssignments: Map<string,SplitAssignment> | null;
+  base: Simulation;
+  actualSurface: number;
+  committedSurface: number;
+  targetValue: number;
+};
+
+async function recoveryTrials(ctx:RecoveryTrialContext,critical:CapacityCriticalPathJob[]):Promise<CapacityRecoveryOption[]>{
+  const cfg=ctx.capacityModel.criticalPathRecovery;if(!cfg.enabled||!cfg.recoveryEnabled||cfg.recoveryMaxTrials<=0)return[];
+  const baselineForecast=simulationForecast(ctx.actualSurface,ctx.committedSurface,ctx.base);if(cfg.recoveryOnlyWhenTargetGap&&baselineForecast>=ctx.targetValue)return[];
+  const jobMap=new Map(ctx.base.jobs.map((x)=>[x.jobNum,x]));const nodeMap=new Map(ctx.base.nodes.map((x)=>[x.id,x]));
+  type Spec={actionType:CapacityRecoveryOption["actionType"];title:string;node:BatchNode|null;jobNum:string|null;keys:Set<string>;jobs:Set<string>;rationale:string};const specs:Spec[]=[];const seen=new Set<string>();
+  const nodeScores=ctx.base.nodes.filter((node)=>node.sourceKind!=="FIXED_SCHEDULE").map((node)=>{
+    const lostJobs=[...new Set(node.members.map((m)=>m.row.jobNum))].filter((j)=>!jobMap.get(j)?.contributes);const lostSurface=lostJobs.reduce((sum,j)=>sum+(jobMap.get(j)?.surfaceDm2||0),0);
+    const wait=node.start!=null&&node.batchReadyAt!=null?Math.max(0,(node.start-node.batchReadyAt)/60_000):0;const late=node.start!=null&&node.mustStartBy!=null?Math.max(0,(node.start-node.mustStartBy)/60_000):0;const blocked=node.status==="UNSCHEDULED"||node.status==="DEPENDENCY_CONFLICT"?240:0;
+    return{node,lostJobs,lostSurface,score:(wait+late+blocked)*Math.max(1,lostSurface)};
+  }).filter((x)=>x.score>0).sort((a,b)=>b.score-a.score);
+  for(const item of nodeScores){if(specs.length>=cfg.recoveryMaxTrials)break;const k=trialNodeKey(item.node);if(seen.has(k))continue;seen.add(k);specs.push({actionType:"PRIORITIZE_BATCH",title:`Prioritize ${item.node.batchNo}`,node:item.node,jobNum:null,keys:new Set([k]),jobs:new Set(item.lostJobs.length?item.lostJobs:item.node.members.map((m)=>m.row.jobNum)),rationale:"Trial this batch ahead of competing ready batches on shared finite resources, then re-run the complete downstream route to FINSST."});}
+  for(const cp of critical){if(specs.length>=cfg.recoveryMaxTrials)break;if(cp.finiteStatus==="ON_TIME")continue;const chain=ctx.base.chains.find((x)=>x.row.planningJobId===cp.planningJobId);if(!chain)continue;const keys=new Set<string>();for(const member of chain.members){const id=ctx.base.memberNode.get(member.key);const node=id?nodeMap.get(id):null;if(node&&node.sourceKind!=="FIXED_SCHEDULE")keys.add(trialNodeKey(node));}if(!keys.size)continue;const sig=[...keys].sort().join("|");if(seen.has(sig))continue;seen.add(sig);specs.push({actionType:"PRIORITIZE_CRITICAL_CHAIN",title:`Prioritize critical chain · ${cp.jobNum}`,node:null,jobNum:cp.jobNum,keys,jobs:new Set([cp.jobNum]),rationale:"Trial-prioritize every schedulable batch on this Job route while preserving all predecessor gates and finite resource limits."});}
+  const out:CapacityRecoveryOption[]=[];
+  for(const spec of specs){
+    const trial=await simulate(ctx.capacityRows,ctx.selected,ctx.rawMap,ctx.planningModel,ctx.batchModel,ctx.capacityModel,ctx.recipeModel,ctx.existing,ctx.scenarioStart,ctx.cutoff,ctx.horizonEnd,ctx.splitAssignments,{priorityNodeKeys:spec.keys});
+    const forecast=simulationForecast(ctx.actualSurface,ctx.committedSurface,trial);const recovered=Math.max(0,forecast-baselineForecast);if(recovered<cfg.minRecoveredSurfaceDm2&&!cfg.includeNoGainTrials)continue;
+    let suggestedResource:string|null=null;if(spec.node){const trialNode=trial.nodes.find((x)=>trialNodeKey(x)===trialNodeKey(spec.node!));suggestedResource=trialNode?.resourceInstance||null;}
+    out.push({rank:0,actionType:spec.actionType,title:spec.title,batchNo:spec.node?.batchNo||null,jobNum:spec.jobNum,mainOperationCode:spec.node?.mainOperation.code||null,currentResource:spec.node?.resourceInstance||null,suggestedResource,recoveredMinutes:finishImprovementMinutes(ctx.base,trial,spec.jobs),recoveredSurfaceDm2:recovered,projectedForecastSurface:forecast,projectedGap:Math.max(0,ctx.targetValue-forecast),verifiedByResimulation:true,result:recovered>0?"IMPROVES":"NO_GAIN",rationale:spec.rationale});
+  }
+  return out.sort((a,b)=>b.recoveredSurfaceDm2-a.recoveredSurfaceDm2||b.recoveredMinutes-a.recoveredMinutes).map((x,i)=>({...x,rank:i+1}));
 }
 
 function nodeToPublic(node:BatchNode):ProposedCapacityBatch{
@@ -988,7 +1203,7 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
   const finalSelectedRows=potential.filter(x=>selected.has(x.planningJobId));const capacityRows=[...plannedRows,...finalSelectedRows];
   const baselineSim=await simulate(capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd);
   const baselineFiniteForecast=base.summary.actualSurface+base.summary.committedSurface+baselineSim.feasiblePlannedSurface+baselineSim.feasibleCandidateSurface;
-  let finalSim=baselineSim;let splitRecoveredSurface=0;let splitSourceBatchCount=0;
+  let finalSim=baselineSim;let finalSplitAssignments:Map<string,SplitAssignment>|null=null;let splitRecoveredSurface=0;let splitSourceBatchCount=0;
   const mayTrySplit=capacityModel.smartBatchSplit.enabled&&(!capacityModel.smartBatchSplit.onlyWhenTargetRecovery||baselineFiniteForecast<options.targetValue);
   if(mayTrySplit){
     const splitAssignments=deriveSmartSplitAssignments(baselineSim,capacityModel,scenarioStart);
@@ -999,13 +1214,20 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
       const baselineProblems=baselineSim.nodes.filter(x=>x.status==="LATE_START"||x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length;
       const splitProblems=splitSim.nodes.filter(x=>x.status==="LATE_START"||x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length;
       if(splitForecast>baselineFiniteForecast+0.001||(!capacityModel.smartBatchSplit.onlyWhenTargetRecovery&&splitForecast>=baselineFiniteForecast-0.001&&splitProblems<baselineProblems)){
-        finalSim=splitSim;splitRecoveredSurface=Math.max(0,splitForecast-baselineFiniteForecast);
+        finalSim=splitSim;finalSplitAssignments=splitAssignments;splitRecoveredSurface=Math.max(0,splitForecast-baselineFiniteForecast);
       }else splitSourceBatchCount=0;
     }
   }
   sim=finalSim;
   const finiteForecast=base.summary.actualSurface+base.summary.committedSurface+sim.feasiblePlannedSurface+sim.feasibleCandidateSurface;
   const remainingGap=Math.max(0,options.targetValue-finiteForecast);
+  const criticalPaths=criticalPathAnalysis(sim,cutoff,scenarioStart,capacityModel);
+  const bottlenecks=bottleneckAnalysis(sim,criticalPaths,capacityModel,scenarioStart);
+  let recoveryOptions=await recoveryTrials({capacityRows,selected,rawMap,planningModel,batchModel,capacityModel,recipeModel,existing,scenarioStart,cutoff,horizonEnd,splitAssignments:finalSplitAssignments,base:sim,actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,targetValue:options.targetValue},criticalPaths);
+  if(splitRecoveredSurface>0){
+    recoveryOptions.push({rank:0,actionType:"SMART_SPLIT",title:"Keep verified Smart Batch Split",batchNo:null,jobNum:null,mainOperationCode:null,currentResource:null,suggestedResource:null,recoveredMinutes:0,recoveredSurfaceDm2:splitRecoveredSurface,projectedForecastSurface:finiteForecast,projectedGap:remainingGap,verifiedByResimulation:true,result:"IMPROVES",rationale:"v021 Smart Batch Split was re-simulated through the complete downstream route and retained because it improved finite-capacity ST Output before FINSST cutoff."});
+  }
+  recoveryOptions=recoveryOptions.sort((a,b)=>b.recoveredSurfaceDm2-a.recoveredSurfaceDm2||b.recoveredMinutes-a.recoveredMinutes).map((x,i)=>({...x,rank:i+1}));
   const contributing=sim.jobs.filter(x=>x.contributes&&selected.has(x.planningJobId));
   const anyReview=contributing.some(x=>x.capacityReview);
   const targetFeasibility:FiniteCapacityResult["targetFeasibility"]=remainingGap>0?"NOT_FEASIBLE":anyReview?"PROVISIONAL":"CONFIRMED";
@@ -1014,13 +1236,17 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
   if(splitBatchCount&&!splitSourceBatchCount)splitSourceBatchCount=new Set(publicBatches.filter(x=>x.smartSplitApplied&&x.splitParentKey).map(x=>x.splitParentKey!)).size;
   const warnings=[...new Set(sim.warnings)];
   if(splitBatchCount)warnings.push(`SMART_BATCH_SPLIT_BATCHES:${splitBatchCount}`,`SMART_BATCH_SPLIT_RECOVERED_DM2:${Math.round(splitRecoveredSurface)}`);
+  if(criticalPaths.length)warnings.push(`CRITICAL_PATH_JOBS:${criticalPaths.length}`);
+  if(bottlenecks.length)warnings.push(`CAPACITY_BOTTLENECKS:${bottlenecks.length}`);
+  if(recoveryOptions.some(x=>x.result==="IMPROVES"))warnings.push(`VERIFIED_RECOVERY_OPTIONS:${recoveryOptions.filter(x=>x.result==="IMPROVES").length}`,"RECOVERY_TRIALS_ARE_SIMULATION_ONLY");
   if(targetFeasibility==="PROVISIONAL")warnings.push("TARGET_REACHED_BUT_ONE_OR_MORE_CONTRIBUTING_STEPS_HAVE_NO_CONFIGURED_FINITE_RESOURCE");
   if(remainingGap>0)warnings.push(`FINITE_CAPACITY_GAP:${Math.round(remainingGap)}`);
   const processTimeForecast=base.summary.actualSurface+base.summary.committedSurface+sumSurface(plannedRows)+sim.selectedCandidateSurface;
+  const bestRecoverySurfaceDm2=recoveryOptions.reduce((m,x)=>Math.max(m,x.recoveredSurfaceDm2),0);
   return{
     targetDate:options.targetDate,cutoffTime:options.cutoffTime,cutoffAt:wallIso(cutoff)!,targetValue:options.targetValue,scenarioStartAt:wallIso(scenarioStart)!,horizonEndAt:wallIso(horizonEnd)!,endpointOperation:base.endpointOperation,targetFeasibility,
-    summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,baselineFiniteCapacityForecastSurface:baselineFiniteForecast,splitRecoveredSurface,dependencyEdgeCount:sim.dependencies.length,splitBatchCount,splitSourceBatchCount,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length},
-    selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,dependencies:sim.dependencies,warnings,
+    summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,baselineFiniteCapacityForecastSurface:baselineFiniteForecast,splitRecoveredSurface,dependencyEdgeCount:sim.dependencies.length,splitBatchCount,splitSourceBatchCount,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length,criticalJobCount:criticalPaths.length,bottleneckCount:bottlenecks.length,recoveryOptionCount:recoveryOptions.length,bestRecoverySurfaceDm2},
+    selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,dependencies:sim.dependencies,criticalPaths,bottlenecks,recoveryOptions,warnings,
   };
 }
 

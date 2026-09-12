@@ -98,6 +98,18 @@ export type SmartBatchSplitModel = {
   splitPenaltyMinutes: number;
 };
 
+export type CriticalPathRecoveryModel = {
+  enabled: boolean;
+  nearCutoffMinutes: number;
+  bottleneckTopN: number;
+  bottleneckMinDelayMinutes: number;
+  recoveryEnabled: boolean;
+  recoveryOnlyWhenTargetGap: boolean;
+  recoveryMaxTrials: number;
+  minRecoveredSurfaceDm2: number;
+  includeNoGainTrials: boolean;
+};
+
 export type CapacityModel = {
   resources: Record<string, CapacityResourceDefinition>;
   resourceList: CapacityResourceDefinition[];
@@ -115,6 +127,7 @@ export type CapacityModel = {
   manualPrerequisiteGateMode: "CONSECUTIVE_ROUTE_MANUAL_CHAIN";
   dependencyGraphEnabled: boolean;
   smartBatchSplit: SmartBatchSplitModel;
+  criticalPathRecovery: CriticalPathRecoveryModel;
   chemicalLine: ChemicalLineCapacityModel;
   painting: PaintingCapacityModel;
   manualWork: ManualWorkCapacityModel;
@@ -150,6 +163,11 @@ export async function getCapacityModel(): Promise<CapacityModel> {
     smartBatchSplit: {
       enabled: true, onlyWhenTargetRecovery: true, delayThresholdMinutes: 60, minReadyJobs: 2,
       minReadySurfaceDm2: 500, maxParts: 3, splitPenaltyMinutes: 10,
+    },
+    criticalPathRecovery: {
+      enabled: true, nearCutoffMinutes: 60, bottleneckTopN: 10, bottleneckMinDelayMinutes: 15,
+      recoveryEnabled: true, recoveryOnlyWhenTargetGap: true, recoveryMaxTrials: 4,
+      minRecoveredSurfaceDm2: 100, includeNoGainTrials: false,
     },
     chemicalLine: {
       enabled: true, resourceCode: "FLYBAR", processMaxConcurrent: 3, ndtRecipeNos: ["001","009","016","025"],
@@ -253,6 +271,17 @@ export async function getCapacityModel(): Promise<CapacityModel> {
         minReadySurfaceDm2: Math.max(0, num(settings["capacity.smartBatchSplitMinReadySurfaceDm2"], defaults.smartBatchSplit.minReadySurfaceDm2)),
         maxParts: Math.max(2, Math.min(8, Math.trunc(num(settings["capacity.smartBatchSplitMaxParts"], defaults.smartBatchSplit.maxParts)))),
         splitPenaltyMinutes: Math.max(0, Math.min(24*60, num(settings["capacity.smartBatchSplitPenaltyMinutes"], defaults.smartBatchSplit.splitPenaltyMinutes))),
+      },
+      criticalPathRecovery: {
+        enabled: bool(settings["capacity.criticalPathEnabled"], defaults.criticalPathRecovery.enabled),
+        nearCutoffMinutes: Math.max(0, Math.min(24*60, num(settings["capacity.criticalPathNearCutoffMinutes"], defaults.criticalPathRecovery.nearCutoffMinutes))),
+        bottleneckTopN: Math.max(1, Math.min(50, Math.trunc(num(settings["capacity.bottleneckTopN"], defaults.criticalPathRecovery.bottleneckTopN)))),
+        bottleneckMinDelayMinutes: Math.max(0, Math.min(24*60, num(settings["capacity.bottleneckMinDelayMinutes"], defaults.criticalPathRecovery.bottleneckMinDelayMinutes))),
+        recoveryEnabled: bool(settings["capacity.recoveryEnabled"], defaults.criticalPathRecovery.recoveryEnabled),
+        recoveryOnlyWhenTargetGap: bool(settings["capacity.recoveryOnlyWhenTargetGap"], defaults.criticalPathRecovery.recoveryOnlyWhenTargetGap),
+        recoveryMaxTrials: Math.max(0, Math.min(12, Math.trunc(num(settings["capacity.recoveryMaxTrials"], defaults.criticalPathRecovery.recoveryMaxTrials)))),
+        minRecoveredSurfaceDm2: Math.max(0, num(settings["capacity.recoveryMinRecoveredSurfaceDm2"], defaults.criticalPathRecovery.minRecoveredSurfaceDm2)),
+        includeNoGainTrials: bool(settings["capacity.recoveryIncludeNoGainTrials"], defaults.criticalPathRecovery.includeNoGainTrials),
       },
       chemicalLine: {
         enabled: bool(settings["capacity.chemicalLineSegmented"], defaults.chemicalLine.enabled),
