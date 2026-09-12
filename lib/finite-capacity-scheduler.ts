@@ -224,6 +224,93 @@ export type CapacityRecoveryOption = {
   rationale: string;
 };
 
+export type CapacityBackwardBatchRequirement = {
+  rank: number;
+  batchNo: string;
+  sourceKind: ProposedCapacityBatch["sourceKind"];
+  mainOperationCode: string;
+  mainOperationLabel: string;
+  scheduleAreaCode: string;
+  scheduleAreaLabel: string;
+  plannerCode: string | null;
+  plannerLabel: string | null;
+  recipeNo: string | null;
+  recipeName: string | null;
+  targetJobCount: number;
+  targetJobs: string[];
+  batchJobCount: number;
+  targetSurfaceDm2: number;
+  batchSurfaceDm2: number;
+  durationMinutes: number;
+  mustStartBy: string | null;
+  mustFinishBy: string | null;
+  simulatedStartAt: string | null;
+  simulatedEndAt: string | null;
+  batchReadyAt: string | null;
+  resourceBase: string | null;
+  resourceInstance: string | null;
+  predecessorBatches: string[];
+  slackMinutes: number | null;
+  status: "ON_TIME" | "AT_RISK" | "UNSCHEDULED";
+};
+
+export type CapacityBackwardOperationRequirement = {
+  mainOperationCode: string;
+  mainOperationLabel: string;
+  scheduleAreaCode: string;
+  scheduleAreaLabel: string;
+  plannerCode: string | null;
+  plannerLabel: string | null;
+  recipeNo: string | null;
+  recipeName: string | null;
+  batchCount: number;
+  targetJobCount: number;
+  targetSurfaceDm2: number;
+  totalProcessMinutes: number;
+  mustStartBy: string | null;
+  mustFinishBy: string | null;
+  batches: string[];
+  atRiskBatchCount: number;
+};
+
+export type CapacityBackwardAreaRequirement = {
+  scheduleAreaCode: string;
+  scheduleAreaLabel: string;
+  plannerCode: string | null;
+  plannerLabel: string | null;
+  batchCount: number;
+  targetJobCount: number;
+  uniqueTargetSurfaceDm2: number;
+  requiredFlowSurfaceDm2: number;
+  totalProcessMinutes: number;
+  earliestMustStartBy: string | null;
+  earliestMustFinishBy: string | null;
+  mainOperations: string[];
+  recipes: string[];
+  batches: string[];
+  atRiskBatchCount: number;
+};
+
+export type CapacityBackwardTargetPlan = {
+  enabled: boolean;
+  strategy: string;
+  requiredAdditionalSurfaceDm2: number;
+  reservePct: number;
+  portfolioTargetSurfaceDm2: number;
+  selectedPortfolioSurfaceDm2: number;
+  reserveSurfaceDm2: number;
+  selectedJobCount: number;
+  selectedJobNums: string[];
+  earliestRequiredStartAt: string | null;
+  batchCount: number;
+  areaCount: number;
+  atRiskBatchCount: number;
+  batches: CapacityBackwardBatchRequirement[];
+  operationRequirements: CapacityBackwardOperationRequirement[];
+  areaRequirements: CapacityBackwardAreaRequirement[];
+  warnings: string[];
+};
+
 export type FiniteCapacityResult = {
   targetDate: string;
   cutoffTime: string;
@@ -257,6 +344,11 @@ export type FiniteCapacityResult = {
     bottleneckCount: number;
     recoveryOptionCount: number;
     bestRecoverySurfaceDm2: number;
+    backwardRequiredSurfaceDm2: number;
+    backwardPortfolioSurfaceDm2: number;
+    backwardBatchCount: number;
+    backwardAreaCount: number;
+    backwardAtRiskBatchCount: number;
   };
   selectedJobNums: string[];
   finiteRecommendedJobNums: string[];
@@ -268,6 +360,7 @@ export type FiniteCapacityResult = {
   criticalPaths: CapacityCriticalPathJob[];
   bottlenecks: CapacityBottleneck[];
   recoveryOptions: CapacityRecoveryOption[];
+  backwardPlan: CapacityBackwardTargetPlan;
   warnings: string[];
 };
 
@@ -1171,6 +1264,73 @@ function nodeToPublic(node:BatchNode):ProposedCapacityBatch{
   };
 }
 
+
+function buildBackwardTargetPlan(
+  sim: Simulation,
+  capacityModel: CapacityModel,
+  cutoff: number,
+  targetValue: number,
+  actualSurface: number,
+  committedSurface: number,
+): CapacityBackwardTargetPlan {
+  const cfg=capacityModel.backwardTarget;
+  const empty:CapacityBackwardTargetPlan={enabled:cfg.enabled,strategy:`${cfg.plannedFirst?"PLANNED_FIRST":"MIXED"}_${cfg.portfolioSort}`,requiredAdditionalSurfaceDm2:Math.max(0,targetValue-actualSurface-committedSurface),reservePct:cfg.reservePct,portfolioTargetSurfaceDm2:0,selectedPortfolioSurfaceDm2:0,reserveSurfaceDm2:0,selectedJobCount:0,selectedJobNums:[],earliestRequiredStartAt:null,batchCount:0,areaCount:0,atRiskBatchCount:0,batches:[],operationRequirements:[],areaRequirements:[],warnings:[]};
+  if(!cfg.enabled)return empty;
+  const required=Math.max(0,targetValue-actualSurface-committedSurface);
+  const portfolioTarget=required*(1+cfg.reservePct/100);
+  empty.portfolioTargetSurfaceDm2=portfolioTarget;
+  if(required<=0){empty.warnings.push("TARGET_ALREADY_SECURED_BY_ACTUAL_AND_COMMITTED_OUTPUT");return empty;}
+  const finishMs=(x:CapacityJobResult)=>parseWall(x.finishAt)??Number.POSITIVE_INFINITY;
+  const feasibleRank=(x:CapacityJobResult)=>x.contributes?0:x.finiteStatus==="LATE"?1:2;
+  const statusRank=(x:CapacityJobResult)=>cfg.plannedFirst?(x.sourceStatus==="PLANNED"?0:x.sourceStatus==="NEED_PLAN"?1:2):0;
+  const pool=sim.jobs.filter(x=>x.sourceStatus==="PLANNED"||x.sourceStatus==="NEED_PLAN")
+    .sort((a,b)=>feasibleRank(a)-feasibleRank(b)||statusRank(a)-statusRank(b)||(cfg.portfolioSort==="HIGHEST_SURFACE"?b.surfaceDm2-a.surfaceDm2:finishMs(a)-finishMs(b))||b.surfaceDm2-a.surfaceDm2||a.jobNum.localeCompare(b.jobNum));
+  const selectedIds=new Set<number>();const selectedJobs:string[]=[];let selectedSurface=0;
+  for(const job of pool){if(selectedIds.size>=cfg.maxPortfolioJobs)break;selectedIds.add(job.planningJobId);selectedJobs.push(job.jobNum);selectedSurface+=job.surfaceDm2;if(selectedSurface+1e-6>=portfolioTarget)break;}
+  empty.selectedPortfolioSurfaceDm2=selectedSurface;empty.reserveSurfaceDm2=Math.max(0,selectedSurface-required);empty.selectedJobCount=selectedJobs.length;empty.selectedJobNums=selectedJobs;
+  const selectedRiskCount=pool.filter(x=>selectedIds.has(x.planningJobId)&&!x.contributes).length;
+  if(selectedRiskCount)empty.warnings.push(`BACKWARD_PORTFOLIO_INCLUDES_AT_RISK_JOBS:${selectedRiskCount}`);
+  if(selectedSurface+1e-6<required)empty.warnings.push(`BACKWARD_PORTFOLIO_SHORTFALL_DM2:${Math.round(required-selectedSurface)}`);
+  const jobSurface=new Map(sim.jobs.map(x=>[x.planningJobId,x.surfaceDm2]));
+  const nodeMap=new Map(sim.nodes.map(x=>[x.id,x]));
+  type ReqAcc={node:BatchNode;latestStart:number;latestFinish:number;jobIds:Set<number>;jobNums:Set<string>};
+  const reqMap=new Map<string,ReqAcc>();
+  for(const chain of sim.chains){
+    if(!selectedIds.has(chain.row.planningJobId))continue;
+    let cursor=cutoff-chain.tailLagMinutes*60_000;
+    for(let i=chain.members.length-1;i>=0;i--){
+      const member=chain.members[i];const nodeId=sim.memberNode.get(member.key);const node=nodeId?nodeMap.get(nodeId):null;if(!node)continue;
+      const latestFinish=cursor;const latestStart=latestFinish-Math.max(0,node.durationMinutes)*60_000;
+      let acc=reqMap.get(node.id);if(!acc){acc={node,latestStart,latestFinish,jobIds:new Set(),jobNums:new Set()};reqMap.set(node.id,acc);}else{acc.latestStart=Math.min(acc.latestStart,latestStart);acc.latestFinish=Math.min(acc.latestFinish,latestFinish);}
+      acc.jobIds.add(chain.row.planningJobId);acc.jobNums.add(chain.row.jobNum);
+      cursor=latestStart-member.lagBeforeMinutes*60_000;
+    }
+  }
+  const requirements:CapacityBackwardBatchRequirement[]=[];
+  for(const acc of reqMap.values()){
+    const node=acc.node;const targetSurface=[...acc.jobIds].reduce((sum,id)=>sum+(jobSurface.get(id)||0),0);const batchSurface=node.members.reduce((sum,m)=>sum+m.row.surfaceDm2,0);
+    const area=node.mainOperation.scheduleArea||node.mainOperation.physicalArea||{code:"UNMAPPED",label:"Unmapped Area"};const planner=node.mainOperation.planner;
+    const simStart=node.start,simEnd=node.end;const slack=simStart==null?null:(acc.latestStart-simStart)/60_000;
+    const status:CapacityBackwardBatchRequirement["status"]=simStart==null||simEnd==null?"UNSCHEDULED":(simStart>acc.latestStart+1||simEnd>acc.latestFinish+1)?"AT_RISK":"ON_TIME";
+    requirements.push({rank:0,batchNo:node.batchNo,sourceKind:node.sourceKind==="FIXED_SCHEDULE"?"FIXED_SCHEDULE":node.sourceKind,mainOperationCode:node.mainOperation.code,mainOperationLabel:node.mainOperation.label,scheduleAreaCode:area.code,scheduleAreaLabel:area.label,plannerCode:planner?.code||null,plannerLabel:planner?.label||null,recipeNo:node.recipeNo,recipeName:node.recipeName,targetJobCount:acc.jobIds.size,targetJobs:[...acc.jobNums].sort(),batchJobCount:node.members.length,targetSurfaceDm2:targetSurface,batchSurfaceDm2:batchSurface,durationMinutes:node.durationMinutes,mustStartBy:wallIso(acc.latestStart),mustFinishBy:wallIso(acc.latestFinish),simulatedStartAt:wallIso(simStart),simulatedEndAt:wallIso(simEnd),batchReadyAt:wallIso(node.batchReadyAt),resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,predecessorBatches:node.dependencyBatches.map(x=>x.batchNo),slackMinutes:slack==null?null:Math.round(slack),status});
+  }
+  requirements.sort((a,b)=>(a.mustFinishBy||"9999").localeCompare(b.mustFinishBy||"9999")||(a.mustStartBy||"9999").localeCompare(b.mustStartBy||"9999")||a.batchNo.localeCompare(b.batchNo));
+  requirements.forEach((x,i)=>x.rank=i+1);
+  type OpAcc={sample:CapacityBackwardBatchRequirement;batches:Set<string>;jobs:Set<string>;surfaceByJob:Map<string,number>;minutes:number;start:number|null;finish:number|null;atRisk:number};
+  const opMap=new Map<string,OpAcc>();
+  for(const r of requirements){const k=[r.scheduleAreaCode,r.mainOperationCode,r.recipeNo||"NO_RECIPE"].join("|");let a=opMap.get(k);if(!a){a={sample:r,batches:new Set(),jobs:new Set(),surfaceByJob:new Map(),minutes:0,start:null,finish:null,atRisk:0};opMap.set(k,a);}a.batches.add(r.batchNo);a.minutes+=r.durationMinutes;if(r.status!=="ON_TIME")a.atRisk++;const st=parseWall(r.mustStartBy),fn=parseWall(r.mustFinishBy);if(st!=null)a.start=a.start==null?st:Math.min(a.start,st);if(fn!=null)a.finish=a.finish==null?fn:Math.min(a.finish,fn);for(const j of r.targetJobs){a.jobs.add(j);const job=sim.jobs.find(x=>x.jobNum===j);if(job)a.surfaceByJob.set(j,job.surfaceDm2);}}
+  const operationRequirements:CapacityBackwardOperationRequirement[]=[...opMap.values()].map(a=>({mainOperationCode:a.sample.mainOperationCode,mainOperationLabel:a.sample.mainOperationLabel,scheduleAreaCode:a.sample.scheduleAreaCode,scheduleAreaLabel:a.sample.scheduleAreaLabel,plannerCode:a.sample.plannerCode,plannerLabel:a.sample.plannerLabel,recipeNo:a.sample.recipeNo,recipeName:a.sample.recipeName,batchCount:a.batches.size,targetJobCount:a.jobs.size,targetSurfaceDm2:[...a.surfaceByJob.values()].reduce((s,x)=>s+x,0),totalProcessMinutes:a.minutes,mustStartBy:wallIso(a.start),mustFinishBy:wallIso(a.finish),batches:[...a.batches].sort(),atRiskBatchCount:a.atRisk})).sort((a,b)=>(a.mustFinishBy||"9999").localeCompare(b.mustFinishBy||"9999")||a.scheduleAreaCode.localeCompare(b.scheduleAreaCode)||a.mainOperationCode.localeCompare(b.mainOperationCode));
+  type AreaAcc={sample:CapacityBackwardBatchRequirement;batches:Set<string>;jobs:Set<string>;surfaceByJob:Map<string,number>;flowSurface:number;minutes:number;start:number|null;finish:number|null;mains:Set<string>;recipes:Set<string>;atRisk:number};
+  const areaMap=new Map<string,AreaAcc>();
+  if(cfg.includeAreaRollup){for(const r of requirements){let a=areaMap.get(r.scheduleAreaCode);if(!a){a={sample:r,batches:new Set(),jobs:new Set(),surfaceByJob:new Map(),flowSurface:0,minutes:0,start:null,finish:null,mains:new Set(),recipes:new Set(),atRisk:0};areaMap.set(r.scheduleAreaCode,a);}a.batches.add(r.batchNo);a.flowSurface+=r.targetSurfaceDm2;a.minutes+=r.durationMinutes;a.mains.add(r.mainOperationCode);if(r.recipeNo)a.recipes.add(r.recipeNo);if(r.status!=="ON_TIME")a.atRisk++;const st=parseWall(r.mustStartBy),fn=parseWall(r.mustFinishBy);if(st!=null)a.start=a.start==null?st:Math.min(a.start,st);if(fn!=null)a.finish=a.finish==null?fn:Math.min(a.finish,fn);for(const j of r.targetJobs){a.jobs.add(j);const job=sim.jobs.find(x=>x.jobNum===j);if(job)a.surfaceByJob.set(j,job.surfaceDm2);}}}
+  const areaRequirements:CapacityBackwardAreaRequirement[]=[...areaMap.values()].map(a=>({scheduleAreaCode:a.sample.scheduleAreaCode,scheduleAreaLabel:a.sample.scheduleAreaLabel,plannerCode:a.sample.plannerCode,plannerLabel:a.sample.plannerLabel,batchCount:a.batches.size,targetJobCount:a.jobs.size,uniqueTargetSurfaceDm2:[...a.surfaceByJob.values()].reduce((s,x)=>s+x,0),requiredFlowSurfaceDm2:a.flowSurface,totalProcessMinutes:a.minutes,earliestMustStartBy:wallIso(a.start),earliestMustFinishBy:wallIso(a.finish),mainOperations:[...a.mains].sort(),recipes:[...a.recipes].sort(),batches:[...a.batches].sort(),atRiskBatchCount:a.atRisk})).sort((a,b)=>(a.earliestMustFinishBy||"9999").localeCompare(b.earliestMustFinishBy||"9999")||a.scheduleAreaCode.localeCompare(b.scheduleAreaCode));
+  const requiredStarts=requirements.map(x=>parseWall(x.mustStartBy)).filter((x):x is number=>x!=null);
+  empty.batches=requirements;empty.operationRequirements=operationRequirements;empty.areaRequirements=areaRequirements;empty.batchCount=requirements.length;empty.areaCount=areaRequirements.length;empty.atRiskBatchCount=requirements.filter(x=>x.status!=="ON_TIME").length;empty.earliestRequiredStartAt=requiredStarts.length?wallIso(Math.min(...requiredStarts)):null;
+  if(empty.atRiskBatchCount)empty.warnings.push(`BACKWARD_REQUIRED_BATCHES_AT_RISK:${empty.atRiskBatchCount}`);
+  if(!requirements.length&&selectedJobs.length)empty.warnings.push("BACKWARD_PORTFOLIO_HAS_NO_FINITE_CAPACITY_BATCHES");
+  return empty;
+}
+
 export async function calculateFiniteCapacityTarget(options:FiniteCapacityOptions):Promise<FiniteCapacityResult>{
   const [base,planningModel,batchModel,capacityModel,recipeModel,bootstrap]=await Promise.all([
     calculateStOutputTarget({targetDate:options.targetDate,cutoffTime:options.cutoffTime,targetValue:options.targetValue}),
@@ -1229,6 +1389,7 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
   }
   recoveryOptions=recoveryOptions.sort((a,b)=>b.recoveredSurfaceDm2-a.recoveredSurfaceDm2||b.recoveredMinutes-a.recoveredMinutes).map((x,i)=>({...x,rank:i+1}));
   const contributing=sim.jobs.filter(x=>x.contributes&&selected.has(x.planningJobId));
+  const backwardPlan=buildBackwardTargetPlan(sim,capacityModel,cutoff,options.targetValue,base.summary.actualSurface,base.summary.committedSurface);
   const anyReview=contributing.some(x=>x.capacityReview);
   const targetFeasibility:FiniteCapacityResult["targetFeasibility"]=remainingGap>0?"NOT_FEASIBLE":anyReview?"PROVISIONAL":"CONFIRMED";
   const publicBatches=sim.nodes.map(nodeToPublic).sort((a,b)=>(a.startAt||"9999").localeCompare(b.startAt||"9999")||(a.mustStartBy||"9999").localeCompare(b.mustStartBy||"9999"));
@@ -1239,14 +1400,15 @@ export async function calculateFiniteCapacityTarget(options:FiniteCapacityOption
   if(criticalPaths.length)warnings.push(`CRITICAL_PATH_JOBS:${criticalPaths.length}`);
   if(bottlenecks.length)warnings.push(`CAPACITY_BOTTLENECKS:${bottlenecks.length}`);
   if(recoveryOptions.some(x=>x.result==="IMPROVES"))warnings.push(`VERIFIED_RECOVERY_OPTIONS:${recoveryOptions.filter(x=>x.result==="IMPROVES").length}`,"RECOVERY_TRIALS_ARE_SIMULATION_ONLY");
+  if(backwardPlan.enabled)warnings.push(`BACKWARD_TARGET_BATCHES:${backwardPlan.batchCount}`,`BACKWARD_TARGET_AREAS:${backwardPlan.areaCount}`,...backwardPlan.warnings);
   if(targetFeasibility==="PROVISIONAL")warnings.push("TARGET_REACHED_BUT_ONE_OR_MORE_CONTRIBUTING_STEPS_HAVE_NO_CONFIGURED_FINITE_RESOURCE");
   if(remainingGap>0)warnings.push(`FINITE_CAPACITY_GAP:${Math.round(remainingGap)}`);
   const processTimeForecast=base.summary.actualSurface+base.summary.committedSurface+sumSurface(plannedRows)+sim.selectedCandidateSurface;
   const bestRecoverySurfaceDm2=recoveryOptions.reduce((m,x)=>Math.max(m,x.recoveredSurfaceDm2),0);
   return{
     targetDate:options.targetDate,cutoffTime:options.cutoffTime,cutoffAt:wallIso(cutoff)!,targetValue:options.targetValue,scenarioStartAt:wallIso(scenarioStart)!,horizonEndAt:wallIso(horizonEnd)!,endpointOperation:base.endpointOperation,targetFeasibility,
-    summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,baselineFiniteCapacityForecastSurface:baselineFiniteForecast,splitRecoveredSurface,dependencyEdgeCount:sim.dependencies.length,splitBatchCount,splitSourceBatchCount,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length,criticalJobCount:criticalPaths.length,bottleneckCount:bottlenecks.length,recoveryOptionCount:recoveryOptions.length,bestRecoverySurfaceDm2},
-    selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,dependencies:sim.dependencies,criticalPaths,bottlenecks,recoveryOptions,warnings,
+    summary:{actualSurface:base.summary.actualSurface,committedSurface:base.summary.committedSurface,finitePlannedSurface:sim.feasiblePlannedSurface,finiteRecommendedSurface:sim.feasibleCandidateSurface,selectedCandidateSurface:sim.selectedCandidateSurface,processTimeForecastSurface:processTimeForecast,finiteCapacityForecastSurface:finiteForecast,baselineFiniteCapacityForecastSurface:baselineFiniteForecast,splitRecoveredSurface,dependencyEdgeCount:sim.dependencies.length,splitBatchCount,splitSourceBatchCount,remainingGap,achievementPct:options.targetValue>0?Math.min(999,finiteForecast/options.targetValue*100):0,proposedBatchCount:publicBatches.filter(x=>x.sourceKind==="PROPOSED_BATCH").length,existingBatchToScheduleCount:publicBatches.filter(x=>x.sourceKind==="EXISTING_BATCH").length,lateBatchCount:publicBatches.filter(x=>x.status==="LATE_START").length,unscheduledBatchCount:publicBatches.filter(x=>x.status==="UNSCHEDULED"||x.status==="DEPENDENCY_CONFLICT").length,capacityReviewJobCount:sim.jobs.filter(x=>x.capacityReview).length,criticalJobCount:criticalPaths.length,bottleneckCount:bottlenecks.length,recoveryOptionCount:recoveryOptions.length,bestRecoverySurfaceDm2,backwardRequiredSurfaceDm2:backwardPlan.requiredAdditionalSurfaceDm2,backwardPortfolioSurfaceDm2:backwardPlan.selectedPortfolioSurfaceDm2,backwardBatchCount:backwardPlan.batchCount,backwardAreaCount:backwardPlan.areaCount,backwardAtRiskBatchCount:backwardPlan.atRiskBatchCount},
+    selectedJobNums:potential.filter(x=>selected.has(x.planningJobId)).map(x=>x.jobNum),finiteRecommendedJobNums:contributing.map(x=>x.jobNum),batches:publicBatches,jobs:sim.jobs,timeline:sim.timeline,resources:sim.resources,dependencies:sim.dependencies,criticalPaths,bottlenecks,recoveryOptions,backwardPlan,warnings,
   };
 }
 

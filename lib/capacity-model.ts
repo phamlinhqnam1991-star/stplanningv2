@@ -110,6 +110,15 @@ export type CriticalPathRecoveryModel = {
   includeNoGainTrials: boolean;
 };
 
+export type BackwardTargetModel = {
+  enabled: boolean;
+  reservePct: number;
+  plannedFirst: boolean;
+  portfolioSort: "EARLIEST_FINISH" | "HIGHEST_SURFACE";
+  maxPortfolioJobs: number;
+  includeAreaRollup: boolean;
+};
+
 export type CapacityModel = {
   resources: Record<string, CapacityResourceDefinition>;
   resourceList: CapacityResourceDefinition[];
@@ -128,6 +137,7 @@ export type CapacityModel = {
   dependencyGraphEnabled: boolean;
   smartBatchSplit: SmartBatchSplitModel;
   criticalPathRecovery: CriticalPathRecoveryModel;
+  backwardTarget: BackwardTargetModel;
   chemicalLine: ChemicalLineCapacityModel;
   painting: PaintingCapacityModel;
   manualWork: ManualWorkCapacityModel;
@@ -168,6 +178,10 @@ export async function getCapacityModel(): Promise<CapacityModel> {
       enabled: true, nearCutoffMinutes: 60, bottleneckTopN: 10, bottleneckMinDelayMinutes: 15,
       recoveryEnabled: true, recoveryOnlyWhenTargetGap: true, recoveryMaxTrials: 4,
       minRecoveredSurfaceDm2: 100, includeNoGainTrials: false,
+    },
+    backwardTarget: {
+      enabled: true, reservePct: 0, plannedFirst: true, portfolioSort: "EARLIEST_FINISH",
+      maxPortfolioJobs: 500, includeAreaRollup: true,
     },
     chemicalLine: {
       enabled: true, resourceCode: "FLYBAR", processMaxConcurrent: 3, ndtRecipeNos: ["001","009","016","025"],
@@ -282,6 +296,14 @@ export async function getCapacityModel(): Promise<CapacityModel> {
         recoveryMaxTrials: Math.max(0, Math.min(12, Math.trunc(num(settings["capacity.recoveryMaxTrials"], defaults.criticalPathRecovery.recoveryMaxTrials)))),
         minRecoveredSurfaceDm2: Math.max(0, num(settings["capacity.recoveryMinRecoveredSurfaceDm2"], defaults.criticalPathRecovery.minRecoveredSurfaceDm2)),
         includeNoGainTrials: bool(settings["capacity.recoveryIncludeNoGainTrials"], defaults.criticalPathRecovery.includeNoGainTrials),
+      },
+      backwardTarget: {
+        enabled: bool(settings["capacity.backwardTargetEnabled"], defaults.backwardTarget.enabled),
+        reservePct: Math.max(0, Math.min(100, num(settings["capacity.backwardTargetReservePct"], defaults.backwardTarget.reservePct))),
+        plannedFirst: bool(settings["capacity.backwardTargetPlannedFirst"], defaults.backwardTarget.plannedFirst),
+        portfolioSort: key(settings["capacity.backwardTargetPortfolioSort"]) === "HIGHEST_SURFACE" ? "HIGHEST_SURFACE" : "EARLIEST_FINISH",
+        maxPortfolioJobs: Math.max(1, Math.min(2000, Math.trunc(num(settings["capacity.backwardTargetMaxPortfolioJobs"], defaults.backwardTarget.maxPortfolioJobs)))),
+        includeAreaRollup: bool(settings["capacity.backwardTargetAreaRollup"], defaults.backwardTarget.includeAreaRollup),
       },
       chemicalLine: {
         enabled: bool(settings["capacity.chemicalLineSegmented"], defaults.chemicalLine.enabled),
