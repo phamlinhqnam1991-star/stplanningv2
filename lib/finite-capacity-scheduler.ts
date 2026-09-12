@@ -12,7 +12,7 @@ export type FiniteCapacityOptions = {
   targetValue: number;
 };
 
-export type CapacitySegmentKind = "BLOCK" | "LOADING" | "PROCESS" | "WAIT_NDT" | "NDT" | "UNLOADING" | "PAINT_SETUP" | "PAINT_APPLICATION" | "PAINT_FLASH" | "PAINT_CURE" | "PAINT_RELEASE";
+export type CapacitySegmentKind = "BLOCK" | "LOADING" | "PROCESS" | "WAIT_NDT" | "NDT" | "UNLOADING" | "PAINT_SETUP" | "PAINT_APPLICATION" | "PAINT_FLASH" | "PAINT_CURE" | "PAINT_RELEASE" | "MANUAL_SETUP" | "MANUAL_WORK" | "MANUAL_RELEASE";
 
 export type CapacityBatchSegment = {
   kind: CapacitySegmentKind;
@@ -41,6 +41,18 @@ export type CapacityTimelineEntry = {
   jobs: string[];
   surfaceDm2: number;
   occupiesCapacity: boolean;
+  capacityUnits: number;
+};
+
+export type CapacityBatchPrerequisite = {
+  batchNo: string;
+  mainOperationCode: string;
+  operationCodes: string[];
+  jobs: string[];
+  loadMinutes: number;
+  elapsedMinutes: number | null;
+  startAt: string | null;
+  endAt: string | null;
 };
 
 export type ProposedCapacityBatch = {
@@ -63,6 +75,12 @@ export type ProposedCapacityBatch = {
   startAt: string | null;
   endAt: string | null;
   mustStartBy: string | null;
+  batchReadyAt: string | null;
+  prerequisiteManualBatchCount: number;
+  prerequisiteManualJobCount: number;
+  prerequisiteManualLoadMinutes: number;
+  prerequisiteManualCompleteAt: string | null;
+  prerequisiteManualBatches: CapacityBatchPrerequisite[];
   status: "FIXED" | "ON_TIME" | "LATE_START" | "UNSCHEDULED" | "DEPENDENCY_CONFLICT";
   reason: string | null;
   warnings: string[];
@@ -146,8 +164,18 @@ type MemberDraft = {
   raw: RawContext;
 };
 type JobChain = { row: StOutputJobAssessment; members: MemberDraft[]; tailLagMinutes: number; capacityReview: boolean; blockedReason: string | null };
-type BatchSegment = { kind: CapacitySegmentKind; label: string; start: number; end: number; occupiesCapacity: boolean };
+type BatchSegment = { kind: CapacitySegmentKind; label: string; start: number; end: number; occupiesCapacity: boolean; laborResourceCode?: string | null; laborUnits?: number };
 
+type BatchPrerequisiteInternal = {
+  nodeId: string;
+  batchNo: string;
+  mainOperationCode: string;
+  operationCodes: string[];
+  jobs: string[];
+  loadMinutes: number;
+  start: number | null;
+  end: number | null;
+};
 type BatchNode = {
   id: string;
   sourceKind: "FIXED_SCHEDULE" | "EXISTING_BATCH" | "PROPOSED_BATCH";
@@ -167,6 +195,10 @@ type BatchNode = {
   resourceBase: string | null;
   resourceInstance: string | null;
   mustStartBy: number | null;
+  batchReadyAt: number | null;
+  prerequisiteManualLoadMinutes: number;
+  prerequisiteManualCompleteAt: number | null;
+  prerequisiteManualBatches: BatchPrerequisiteInternal[];
   status: ProposedCapacityBatch["status"];
   reason: string | null;
   warnings: string[];
@@ -188,6 +220,7 @@ type OccupancyInterval = {
   segmentKind: CapacitySegmentKind;
   segmentLabel: string;
   occupiesCapacity: boolean;
+  capacityUnits?: number;
 };
 type OccupancyState = { intervals: OccupancyInterval[] };
 type Simulation = {
@@ -300,6 +333,18 @@ function concurrencyJump(state:OccupancyState,base:string,start:number,end:numbe
   for(let i=0;i<points.length-1;i++){
     if(points[i+1]<=points[i])continue;const mid=(points[i]+points[i+1])/2;const active=list.filter(x=>x.start<mid&&x.end>mid);
     if(active.length>=maxConcurrent)return Math.min(...active.map(x=>x.end));
+  }
+  return null;
+}
+function capacityUnitsJump(state:OccupancyState,base:string,start:number,end:number,maxUnits:number,requestedUnits:number):number|null{
+  const request=Math.max(1,requestedUnits);if(maxUnits<=0||request>maxUnits)return start;
+  const list=state.intervals.filter(x=>x.occupiesCapacity&&key(x.baseResourceCode)===key(base)&&overlap(start,end,x.start,x.end));
+  if(!list.length)return null;
+  const points=[start,end,...list.flatMap(x=>[Math.max(start,x.start),Math.min(end,x.end)])].sort((a,b)=>a-b);
+  for(let i=0;i<points.length-1;i++){
+    if(points[i+1]<=points[i])continue;const mid=(points[i]+points[i+1])/2;const active=list.filter(x=>x.start<mid&&x.end>mid);
+    const used=active.reduce((sum,x)=>sum+Math.max(1,x.capacityUnits||1),0);
+    if(used+request>maxUnits)return Math.min(...active.map(x=>x.end));
   }
   return null;
 }
@@ -421,11 +466,95 @@ function findPaintingSlot(state:OccupancyState,model:CapacityModel,recipeModel:R
   return null;
 }
 
+function manualStepKind(step:StOutputStep,model:CapacityModel):"MASKING"|"UNMASKING"|null{
+  if(!model.manualWork.enabled)return null;
+  const op=key(step.operationCode);
+  // Source route operation wins. UNMASK must be tested first because codes such as UNMSKG contain MSKG.
+  if(op.includes("UNMSK")||op.includes("UNMASK"))return "UNMASKING";
+  if(op.includes("MSKG")||op.includes("MASK")||op.startsWith("MSK")||op.startsWith("FMSKG"))return "MASKING";
+  const main=key(step.mainOperation?.code);
+  if(main==="UNMASKING")return "UNMASKING";
+  if(main==="MASKING"||main==="FMSKG_CM")return "MASKING";
+  return null;
+}
+function isManualWorkStep(step:StOutputStep,model:CapacityModel):boolean{return manualStepKind(step,model)!=null;}
+function isManualWorkNode(node:BatchNode,model:CapacityModel):boolean{return Boolean(node.members[0]&&isManualWorkStep(node.members[0].step,model));}
+function manualRouteContext(steps:StOutputStep[],index:number,model:CapacityModel):string{
+  if(!model.manualWork.routeAwareGrouping)return "";
+  const source=key(steps[index]?.operationCode)||"UNKNOWN";
+  if(model.manualWork.routeContextMode==="SOURCE_OPERATION_ONLY")return source;
+  let prev="START",next="END";
+  for(let i=index-1;i>=0;i--){if(!isManualWorkStep(steps[i],model)){prev=key(steps[i].mainOperation?.code)||key(steps[i].operationCode)||"START";break;}}
+  for(let i=index+1;i<steps.length;i++){if(!isManualWorkStep(steps[i],model)){next=key(steps[i].mainOperation?.code)||key(steps[i].operationCode)||"END";break;}}
+  return model.manualWork.routeContextMode==="NEXT_MAIN"?`${source}>${next}`:`${prev}>${source}>${next}`;
+}
+function matchingManualRule(node:BatchNode,model:CapacityModel){
+  const main=key(node.mainOperation.code);const operation=key(node.members[0]?.step.operationCode);
+  return model.manualWork.rules.find((rule)=>{
+    const c=rule.condition;const exactMain=c.mainOperation==null?"":key(c.mainOperation);const mains=paintList(c.mainOperationIn).map(key);
+    const exactOperation=c.operationCode==null?"":key(c.operationCode);const operations=paintList(c.operationCodeIn).map(key);
+    if(exactMain&&exactMain!==main)return false;if(mains.length&&!mains.includes(main))return false;
+    if(exactOperation&&exactOperation!==operation)return false;if(operations.length&&!operations.includes(operation))return false;return true;
+  })||null;
+}
+function isUnmaskingNode(node:BatchNode,model:CapacityModel):boolean{return node.members[0]?manualStepKind(node.members[0].step,model)==="UNMASKING":key(node.mainOperation.code)==="UNMASKING";}
+function manualResourceOptions(node:BatchNode,model:CapacityModel):string[]{
+  const rule=matchingManualRule(node,model);const action=rule?.action||{};const configured=paintList(action.allowedResources);
+  if(configured.length)return configured;
+  if(node.resourceOptions.length)return node.resourceOptions;
+  return [isUnmaskingNode(node,model)?model.manualWork.unmaskingResourceCode:model.manualWork.maskingResourceCode];
+}
+type ManualProfile={setup:number;workLaborMinutes:number;workElapsedMinutes:number;release:number;operators:number;effectiveOperators:number;laborResourceCode:string;ruleCode:string|null;parallelEfficiency:number};
+function manualProfile(node:BatchNode,model:CapacityModel,laborPoolLimit:number):ManualProfile{
+  const cfg=model.manualWork;const rule=matchingManualRule(node,model);const action=rule?.action||{};const unmask=isUnmaskingNode(node,model);
+  const defaultSetup=unmask?cfg.unmaskingDefaultSetupMinutes:cfg.maskingDefaultSetupMinutes;
+  const memberStats=node.members.map((m)=>{
+    const details=jsonRecord(m.step.processTime.details);const setup=Math.max(0,n(details.setupMinutes,defaultSetup));const qty=Math.max(1,n(details.qty,n(m.row.qty,1)));const minPerPiece=n(details.minutesPerPiece,Number.NaN);const srcOperators=Math.max(1,n(details.operators,1));
+    const labor=Number.isFinite(minPerPiece)?Math.max(0,minPerPiece*qty):Math.max(0,(Math.max(0,n(m.step.durationMinutes,0))-setup)*srcOperators);
+    return{setup,labor};
+  });
+  const aggregation=key(action.setupAggregation)||cfg.setupAggregation;let setup:number;
+  if(action.setupMinutes!=null)setup=paintNum(action.setupMinutes,defaultSetup);
+  else if(aggregation==="SUM_MEMBER")setup=memberStats.reduce((sum,x)=>sum+x.setup,0);
+  else if(aggregation==="FIXED")setup=defaultSetup;
+  else setup=memberStats.length?Math.max(...memberStats.map(x=>x.setup)):defaultSetup;
+  const workLaborMinutes=memberStats.reduce((sum,x)=>sum+x.labor,0);const parallelAllowed=paintBool(action.parallelAllowed,true);
+  const maxOperators=Math.max(1,Math.min(Math.max(1,laborPoolLimit),Math.trunc(paintNum(action.maxOperators,cfg.defaultMaxOperatorsPerBatch))));
+  const minOperators=Math.max(1,Math.min(maxOperators,Math.trunc(paintNum(action.minOperators,1))));const fixedOperators=Number(action.fixedOperators);
+  const threshold=Math.max(1,paintNum(action.operator2ThresholdWorkMinutes,cfg.defaultOperator2ThresholdWorkMinutes));let operators=minOperators;
+  if(Number.isFinite(fixedOperators)&&fixedOperators>0)operators=Math.max(minOperators,Math.min(maxOperators,Math.trunc(fixedOperators)));
+  else if(parallelAllowed)operators=Math.max(minOperators,Math.min(maxOperators,Math.max(1,Math.ceil(workLaborMinutes/threshold))));
+  const parallelEfficiency=Math.max(.1,Math.min(1,paintNum(action.parallelEfficiency,cfg.defaultParallelEfficiency)));const effectiveOperators=operators<=1?1:1+(operators-1)*parallelEfficiency;
+  const workElapsedMinutes=workLaborMinutes/Math.max(1,effectiveOperators);const release=paintNum(action.releaseMinutes,cfg.defaultReleaseMinutes);
+  const laborResourceCode=String(action.laborResourceCode|| (unmask?cfg.unmaskingLaborResourceCode:cfg.maskingLaborResourceCode));
+  return{setup,workLaborMinutes,workElapsedMinutes,release,operators,effectiveOperators,laborResourceCode,ruleCode:rule?.code||null,parallelEfficiency};
+}
+type ManualSlot={start:number;end:number;segments:BatchSegment[];ruleCode:string|null;operators:number;laborResourceCode:string};
+function findManualWorkSlot(state:OccupancyState,model:CapacityModel,def:CapacityResourceDefinition,instance:string,readyAt:number,node:BatchNode,horizonEnd:number):ManualSlot|null{
+  const initialRule=matchingManualRule(node,model);const initialAction=initialRule?.action||{};const initialLaborCode=String(initialAction.laborResourceCode|| (isUnmaskingNode(node,model)?model.manualWork.unmaskingLaborResourceCode:model.manualWork.maskingLaborResourceCode));
+  const laborDef=capacityResource(model,initialLaborCode);const p=manualProfile(node,model,laborDef.maxConcurrent);const durations:[CapacitySegmentKind,string,number,number][]=[
+    ["MANUAL_SETUP","Setup",p.setup,1],["MANUAL_WORK",`Manual work · ${p.operators} operator${p.operators===1?"":"s"}`,p.workElapsedMinutes,p.operators],["MANUAL_RELEASE","Release",p.release,1],
+  ];const elapsed=durations.reduce((sum,x)=>sum+x[2],0)*60_000;let t=readyAt;
+  for(let guard=0;guard<2500&&t+elapsed<=horizonEnd;guard++){
+    const aligned=alignWindow(t,elapsed,def);if(aligned==null)return null;t=aligned;let cursor=t;const segments:BatchSegment[]=[];
+    for(const [kind,label,minutes,laborUnits] of durations){const end=cursor+Math.max(0,minutes)*60_000;if(end>cursor)segments.push({kind,label,start:cursor,end,occupiesCapacity:true,laborResourceCode:p.laborResourceCode,laborUnits});cursor=end;}
+    const stationJump=instanceConflictJump(state,def.baseResourceCode,instance,t,cursor,def.changeoverMinutes,node.recipeNo);if(stationJump!=null&&stationJump>t){t=stationJump;continue;}
+    const stationConcurrent=concurrencyJump(state,def.baseResourceCode,t,cursor,def.maxConcurrent);if(stationConcurrent!=null&&stationConcurrent>t){t=stationConcurrent;continue;}
+    let jump:number|null=null;
+    for(const seg of segments){const units=Math.max(1,seg.laborUnits||1);const j=capacityUnitsJump(state,p.laborResourceCode,seg.start,seg.end,laborDef.maxConcurrent,units);if(j!=null&&j>seg.start){jump=t+(j-seg.start);break;}}
+    if(jump!=null&&jump>t){t=jump;continue;}
+    return{start:t,end:cursor,segments,ruleCode:p.ruleCode,operators:p.operators,laborResourceCode:p.laborResourceCode};
+  }
+  return null;
+}
+
 function addNodeOccupancy(state:OccupancyState,node:BatchNode,base:string,instance:string):void{
   const sourceKind:CapacityTimelineEntry["sourceKind"]=node.sourceKind==="PROPOSED_BATCH"?"PROPOSED_BATCH":"EXISTING_BATCH";
   const jobs=node.members.map((x)=>x.row.jobNum);const surface=node.members.reduce((sum,x)=>sum+x.row.surfaceDm2,0);
   const segments=node.segments.length?node.segments:(node.start!=null&&node.end!=null?[{kind:"BLOCK" as const,label:"Process Block",start:node.start,end:node.end,occupiesCapacity:true}]:[]);
-  for(let i=0;i<segments.length;i++){const seg=segments[i];if(seg.end<=seg.start)continue;state.intervals.push({id:`SIM:${node.id}:${i}`,batchRef:node.batchNo,sourceKind,baseResourceCode:base,resourceInstance:instance,recipeNo:node.recipeNo,start:seg.start,end:seg.end,status:node.status,mainOperationCode:node.mainOperation.code,jobs,surfaceDm2:surface,segmentKind:seg.kind,segmentLabel:seg.label,occupiesCapacity:seg.occupiesCapacity});}
+  for(let i=0;i<segments.length;i++){const seg=segments[i];if(seg.end<=seg.start)continue;state.intervals.push({id:`SIM:${node.id}:${i}`,batchRef:node.batchNo,sourceKind,baseResourceCode:base,resourceInstance:instance,recipeNo:node.recipeNo,start:seg.start,end:seg.end,status:node.status,mainOperationCode:node.mainOperation.code,jobs,surfaceDm2:surface,segmentKind:seg.kind,segmentLabel:seg.label,occupiesCapacity:seg.occupiesCapacity,capacityUnits:1});
+    if(seg.laborResourceCode&&seg.laborUnits&&seg.laborUnits>0){state.intervals.push({id:`SIMLAB:${node.id}:${i}`,batchRef:node.batchNo,sourceKind,baseResourceCode:seg.laborResourceCode,resourceInstance:seg.laborResourceCode,recipeNo:null,start:seg.start,end:seg.end,status:node.status,mainOperationCode:node.mainOperation.code,jobs,surfaceDm2:surface,segmentKind:seg.kind,segmentLabel:`${seg.label} · labor`,occupiesCapacity:true,capacityUnits:seg.laborUnits});}
+  }
 }
 
 function stepMain(step:StOutputStep):MainOperationDefinition|null{return step.mainOperation || null;}
@@ -439,7 +568,8 @@ function buildChains(rows:StOutputJobAssessment[],rawMap:Map<number,RawContext>,
       const step=row.steps[i];const main=stepMain(step);const duration=Math.max(0,step.durationMinutes||0);
       if(!main?.scheduleEnabled){lag+=duration;continue;}
       const hasPaintDefault=capacityModel.painting.enabled&&capacityModel.painting.mainOperationCodes.some((x)=>key(x)===key(main.code))&&capacityModel.painting.defaultResources.length>0;
-      if(!main.resources.length&&!hasPaintDefault){
+      const hasManualDefault=isManualWorkStep(step,capacityModel);
+      if(!main.resources.length&&!hasPaintDefault&&!hasManualDefault){
         if(capacityModel.unmappedResourcePolicy==="BLOCK"){blockedReason=`NO_RESOURCE_MAPPING:${main.code}`;}
         else {capacityReview=true;lag+=duration;}
         continue;
@@ -451,7 +581,8 @@ function buildChains(rows:StOutputJobAssessment[],rawMap:Map<number,RawContext>,
         proposal=resolveBatchProposal({planningJobId:row.planningJobId,jobNum:row.jobNum,program:row.program,partCluster:raw.partCluster,part:row.part,revision:row.revision,nextOperation:step.operationCode,nextStOperation:step.operationCode,mainOperation:main,recipe:step.recipe,processTime:step.processTime,qty:row.qty,surfaceDm2:row.surfaceDm2,rawRow:raw.rawRow},batchModel);
         if(!proposal.eligible){blockedReason=proposal.eligibilityReason||`BATCH_RULE_BLOCK:${main.code}`;}
         const opPart=capacityModel.groupBySourceOperation?`|${key(step.operationCode)}`:"";
-        groupKey=`PROP:${key(main.code)}|${key(proposal.batchKey||main.code)}${opPart}`;
+        const routePart=hasManualDefault&&capacityModel.manualWork.routeAwareGrouping?`|RCTX:${manualRouteContext(row.steps,i,capacityModel)}`:"";
+        groupKey=`PROP:${key(main.code)}|${key(proposal.batchKey||main.code)}${opPart}${routePart}`;
       }
       const memberKey=`${row.planningJobId}:${step.routePosition}:${i}`;
       members.push({key:memberKey,row,step,stepIndex:i,previousMemberKey:prev,lagBeforeMinutes:lag,proposal,groupKey,raw});prev=memberKey;lag=0;
@@ -478,12 +609,16 @@ function buildNodes(chains:JobChain[],capacityModel:CapacityModel):{nodes:BatchN
     if(groupKey.startsWith("FIX:")||groupKey.startsWith("EX:")){
       const first=members[0];const main=first.step.mainOperation!;const fixed=groupKey.startsWith("FIX:");const id=`N${++seq}`;
       const starts=members.map(x=>parseWall(x.step.scheduleStart)).filter((x):x is number=>x!=null);const ends=members.map(x=>parseWall(x.step.scheduleEnd)).filter((x):x is number=>x!=null);
-      const node:BatchNode={id,sourceKind:fixed?"FIXED_SCHEDULE":"EXISTING_BATCH",batchNo:first.step.batchNo||groupKey.slice(3),batchKey:null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members,durationMinutes:batchDuration(members,null),ruleCode:null,resourceOptions:main.resources.map(x=>x.code),fixedStart:fixed&&starts.length?Math.min(...starts):null,fixedEnd:fixed&&ends.length?Math.max(...ends):null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(members),status:fixed?"FIXED":"UNSCHEDULED",reason:null,warnings:[],segments:[]};
+      const node:BatchNode={id,sourceKind:fixed?"FIXED_SCHEDULE":"EXISTING_BATCH",batchNo:first.step.batchNo||groupKey.slice(3),batchKey:null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members,durationMinutes:batchDuration(members,null),ruleCode:null,resourceOptions:main.resources.map(x=>x.code),fixedStart:fixed&&starts.length?Math.min(...starts):null,fixedEnd:fixed&&ends.length?Math.max(...ends):null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(members),batchReadyAt:null,prerequisiteManualLoadMinutes:0,prerequisiteManualCompleteAt:null,prerequisiteManualBatches:[],status:fixed?"FIXED":"UNSCHEDULED",reason:null,warnings:[],segments:[]};
       nodes.push(node);for(const m of members)memberNode.set(m.key,id);continue;
     }
     const proposal=members[0].proposal;let chunk:MemberDraft[]=[];let chunkNo=0;
-    const flush=()=>{if(!chunk.length)return;const first=chunk[0],main=first.step.mainOperation!;const id=`N${++seq}`;const short=main.shortCode||main.code.slice(0,3);const batchNo=`${capacityModel.proposedBatchPrefix}_${short}_${String(++chunkNo).padStart(3,"0")}`;const node:BatchNode={id,sourceKind:"PROPOSED_BATCH",batchNo,batchKey:proposal?.batchKey||null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members:chunk,durationMinutes:batchDuration(chunk,proposal),ruleCode:proposal?.ruleCode||null,resourceOptions:main.resources.map(x=>x.code),fixedStart:null,fixedEnd:null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(chunk),status:"UNSCHEDULED",reason:null,warnings:proposal?.warnings||[],segments:[]};nodes.push(node);for(const m of chunk)memberNode.set(m.key,id);chunk=[];};
-    for(const m of members){if(proposal&&limitExceeded(chunk,m,proposal))flush();chunk.push(m);}flush();
+    const flush=()=>{if(!chunk.length)return;const first=chunk[0],main=first.step.mainOperation!;const id=`N${++seq}`;const short=main.shortCode||main.code.slice(0,3);const batchNo=`${capacityModel.proposedBatchPrefix}_${short}_${String(++chunkNo).padStart(3,"0")}`;const node:BatchNode={id,sourceKind:"PROPOSED_BATCH",batchNo,batchKey:proposal?.batchKey||null,mainOperation:main,recipeNo:first.step.recipe.recipeNo,recipeName:first.step.recipe.recipeName||first.step.recipe.sourceValue||null,members:chunk,durationMinutes:batchDuration(chunk,proposal),ruleCode:proposal?.ruleCode||null,resourceOptions:main.resources.map(x=>x.code),fixedStart:null,fixedEnd:null,start:null,end:null,resourceBase:null,resourceInstance:null,mustStartBy:batchLatestStart(chunk),batchReadyAt:null,prerequisiteManualLoadMinutes:0,prerequisiteManualCompleteAt:null,prerequisiteManualBatches:[],status:"UNSCHEDULED",reason:null,warnings:proposal?.warnings||[],segments:[]};nodes.push(node);for(const m of chunk)memberNode.set(m.key,id);chunk=[];};
+    for(const m of members){
+      const repeatsSameJob=chunk.some((x)=>x.row.planningJobId===m.row.planningJobId);
+      if(repeatsSameJob||(proposal&&limitExceeded(chunk,m,proposal)))flush();
+      chunk.push(m);
+    }flush();
   }
   return{nodes,memberNode};
 }
@@ -496,6 +631,43 @@ function predecessorReady(node:BatchNode,nodeMap:Map<string,BatchNode>,memberNod
   if(node.fixedStart!=null&&node.fixedStart<ready)conflict=true;return{ready,conflict};
 }
 
+function routeManualPrerequisites(node:BatchNode,nodeMap:Map<string,BatchNode>,memberNode:Map<string,string>,capacityModel:CapacityModel):BatchPrerequisiteInternal[]{
+  const byNode=new Map<string,{node:BatchNode;jobs:Set<string>;ops:Set<string>}>();
+  for(const member of node.members){
+    let prevKey=member.previousMemberKey;
+    const visited=new Set<string>();
+    while(prevKey&&!visited.has(prevKey)){
+      visited.add(prevKey);
+      const prevId=memberNode.get(prevKey);
+      if(!prevId||prevId===node.id)break;
+      const prev=nodeMap.get(prevId);
+      if(!prev||!isManualWorkNode(prev,capacityModel))break;
+      let entry=byNode.get(prevId);
+      if(!entry){entry={node:prev,jobs:new Set<string>(),ops:new Set<string>()};byNode.set(prevId,entry);}
+      entry.jobs.add(member.row.jobNum);
+      const prevMember=prev.members.find(pm=>pm.key===prevKey) || prev.members.find(pm=>pm.row.planningJobId===member.row.planningJobId);
+      if(prevMember)entry.ops.add(prevMember.step.operationCode);
+      prevKey=prevMember?.previousMemberKey||null;
+    }
+  }
+  return [...byNode.entries()].map(([nodeId,entry])=>({
+    nodeId,batchNo:entry.node.batchNo,mainOperationCode:entry.node.mainOperation.code,operationCodes:[...entry.ops].sort(),jobs:[...entry.jobs].sort(),
+    loadMinutes:Math.max(0,entry.node.durationMinutes),start:entry.node.start,end:entry.node.end,
+  })).sort((a,b)=>(a.end??Number.POSITIVE_INFINITY)-(b.end??Number.POSITIVE_INFINITY)||a.batchNo.localeCompare(b.batchNo));
+}
+
+function applyBatchGateAudit(node:BatchNode,nodeMap:Map<string,BatchNode>,memberNode:Map<string,string>,capacityModel:CapacityModel,ready:number):void{
+  node.batchReadyAt=Number.isFinite(ready)?ready:null;
+  const prerequisites=routeManualPrerequisites(node,nodeMap,memberNode,capacityModel);
+  node.prerequisiteManualBatches=prerequisites;
+  node.prerequisiteManualLoadMinutes=prerequisites.reduce((sum,x)=>sum+x.loadMinutes,0);
+  node.prerequisiteManualCompleteAt=maxDate(prerequisites.map(x=>x.end));
+  if(prerequisites.length){
+    const jobs=new Set(prerequisites.flatMap(x=>x.jobs));
+    node.warnings=[...new Set([...node.warnings,"ALL_BATCH_JOBS_READY_GATE",`MANUAL_PREREQ_BATCHES:${prerequisites.length}`,`MANUAL_PREREQ_JOBS:${jobs.size}`,`MANUAL_PREREQ_LOAD_MIN:${Math.round(node.prerequisiteManualLoadMinutes)}`])];
+  }
+}
+
 function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:OccupancyState,capacityModel:CapacityModel,recipeModel:RecipeModel,scenarioStart:number,horizonEnd:number):OccupancyState{
   const state:OccupancyState={intervals:initial.intervals.map(x=>({...x,jobs:[...x.jobs]}))};const map=new Map(nodes.map(x=>[x.id,x]));const pending=new Set(nodes.map(x=>x.id));
   let proposalSeq=0;
@@ -503,7 +675,7 @@ function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:O
     const readyNodes=[...pending].map(id=>map.get(id)!).filter(node=>node.members.every(m=>!m.previousMemberKey||memberNode.get(m.previousMemberKey)===node.id||!pending.has(memberNode.get(m.previousMemberKey)||"")));
     if(!readyNodes.length){for(const id of pending){const x=map.get(id)!;x.status="DEPENDENCY_CONFLICT";x.reason="CYCLIC_OR_UNRESOLVED_DEPENDENCY";}break;}
     readyNodes.sort((a,b)=>(a.mustStartBy??Number.POSITIVE_INFINITY)-(b.mustStartBy??Number.POSITIVE_INFINITY)||(a.sourceKind==="EXISTING_BATCH"?-1:1)-(b.sourceKind==="EXISTING_BATCH"?-1:1)||b.members.reduce((s,x)=>s+x.row.surfaceDm2,0)-a.members.reduce((s,x)=>s+x.row.surfaceDm2,0));
-    const node=readyNodes[0];pending.delete(node.id);const dep=predecessorReady(node,map,memberNode,scenarioStart);
+    const node=readyNodes[0];pending.delete(node.id);const dep=predecessorReady(node,map,memberNode,scenarioStart);applyBatchGateAudit(node,map,memberNode,capacityModel,dep.ready);
     if(node.sourceKind==="FIXED_SCHEDULE"){
       node.start=node.fixedStart;node.end=node.fixedEnd;if(dep.conflict){node.status="DEPENDENCY_CONFLICT";node.reason="FIXED_SCHEDULE_STARTS_BEFORE_JOB_IS_READY";}else node.status="FIXED";
       const match=state.intervals.find(x=>key(x.batchRef)===key(node.batchNo)&&node.start!=null&&node.end!=null&&overlap(node.start,node.end,x.start,x.end));if(match){node.resourceBase=match.baseResourceCode;node.resourceInstance=match.resourceInstance;}
@@ -511,8 +683,8 @@ function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:O
       continue;
     }
     if(!Number.isFinite(dep.ready)){node.status="DEPENDENCY_CONFLICT";node.reason="PREDECESSOR_NOT_SCHEDULED";continue;}
-    let best:{start:number;end:number;base:string;instance:string;def:CapacityResourceDefinition;segments:BatchSegment[];paintRuleCode?:string|null}|null=null;
-    const paintNode=isPaintingNode(node,capacityModel);const resourceOptions=paintNode?paintingResourceOptions(node,capacityModel,recipeModel):node.resourceOptions;node.resourceOptions=resourceOptions;
+    let best:{start:number;end:number;base:string;instance:string;def:CapacityResourceDefinition;segments:BatchSegment[];paintRuleCode?:string|null;manualRuleCode?:string|null;manualOperators?:number}|null=null;
+    const paintNode=isPaintingNode(node,capacityModel);const manualNode=isManualWorkNode(node,capacityModel);const resourceOptions=paintNode?paintingResourceOptions(node,capacityModel,recipeModel):manualNode?manualResourceOptions(node,capacityModel):node.resourceOptions;node.resourceOptions=resourceOptions;
     for(const resourceCode of resourceOptions){
       const def=capacityResource(capacityModel,resourceCode);
       for(const inst of capacityInstanceCodes(def)){
@@ -522,6 +694,9 @@ function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:O
         }else if(paintNode){
           const slot=findPaintingSlot(state,capacityModel,recipeModel,def,inst,dep.ready,node,horizonEnd);
           if(slot&&(!best||slot.start<best.start||(slot.start===best.start&&def.sortOrder<best.def.sortOrder)))best={...slot,base:def.baseResourceCode,instance:inst,def,paintRuleCode:slot.ruleCode};
+        }else if(manualNode){
+          const slot=findManualWorkSlot(state,capacityModel,def,inst,dep.ready,node,horizonEnd);
+          if(slot&&(!best||slot.start<best.start||(slot.start===best.start&&def.sortOrder<best.def.sortOrder)))best={...slot,base:def.baseResourceCode,instance:inst,def,manualRuleCode:slot.ruleCode,manualOperators:slot.operators};
         }else{
           const slot=findSlot(state,def,inst,dep.ready,node.durationMinutes,node.recipeNo,horizonEnd);
           if(slot&&(!best||slot.start<best.start||(slot.start===best.start&&def.sortOrder<best.def.sortOrder)))best={...slot,base:def.baseResourceCode,instance:inst,def,segments:[{kind:"BLOCK",label:"Process Block",start:slot.start,end:slot.end,occupiesCapacity:true}]};
@@ -532,6 +707,12 @@ function scheduleNodes(nodes:BatchNode[],memberNode:Map<string,string>,initial:O
     node.start=best.start;node.end=best.end;node.resourceBase=best.base;node.resourceInstance=best.instance;node.segments=best.segments;node.durationMinutes=Math.round((best.end-best.start)/60_000);node.status=node.mustStartBy!=null&&best.start>node.mustStartBy?"LATE_START":"ON_TIME";node.reason=node.status==="LATE_START"?"STARTS_AFTER_BACKWARD_LATEST_START":null;
     if(node.segments.some((seg)=>seg.kind==="WAIT_NDT"))node.warnings=[...new Set([...node.warnings,"NDT_START_SPACING_ADDED_WAIT"])];
     if(paintNode){node.warnings=[...new Set([...node.warnings,"PAINT_SEGMENTED_SCHEDULER"])] ;if(best.paintRuleCode)node.warnings=[...new Set([...node.warnings,`PAINT_RULE:${best.paintRuleCode}`])];}
+    if(manualNode){
+      const first=node.members[0];
+      const routeContext=first?manualRouteContext(first.row.steps,first.stepIndex,capacityModel):"";
+      node.warnings=[...new Set([...node.warnings,"MANUAL_WORKFORCE_SEGMENTED_SCHEDULER",`MANUAL_OPERATORS:${best.manualOperators||1}`,...(routeContext?[`MANUAL_ROUTE_CONTEXT:${routeContext}`]:[])])];
+      if(best.manualRuleCode)node.warnings=[...new Set([...node.warnings,`MANUAL_RULE:${best.manualRuleCode}`])];
+    }
     if(node.sourceKind==="PROPOSED_BATCH"){const short=node.mainOperation.shortCode||node.mainOperation.code.slice(0,3);node.batchNo=`${capacityModel.proposedBatchPrefix}_${short}_${String(++proposalSeq).padStart(3,"0")}`;}
     addNodeOccupancy(state,node,best.base,best.instance);
   }
@@ -549,14 +730,14 @@ function evaluateJobs(chains:JobChain[],nodes:BatchNode[],memberNode:Map<string,
 }
 
 function timelineRows(state:OccupancyState,model:CapacityModel,startAt:number,horizonEnd:number):CapacityTimelineEntry[]{
-  return state.intervals.filter(x=>overlap(startAt,horizonEnd,x.start,x.end)).sort((a,b)=>a.start-b.start||a.resourceInstance.localeCompare(b.resourceInstance)).map(x=>({id:x.id,batchNo:x.batchRef,sourceKind:x.sourceKind,baseResourceCode:x.baseResourceCode,resourceInstance:x.resourceInstance,resourceLabel:capacityResource(model,x.baseResourceCode).label,mainOperationCode:x.mainOperationCode,recipeNo:x.recipeNo,startAt:wallIso(x.start)!,endAt:wallIso(x.end)!,durationMinutes:Math.round((x.end-x.start)/60_000),segmentKind:x.segmentKind,segmentLabel:x.segmentLabel,status:x.status,jobs:x.jobs,surfaceDm2:x.surfaceDm2,occupiesCapacity:x.occupiesCapacity}));
+  return state.intervals.filter(x=>overlap(startAt,horizonEnd,x.start,x.end)).sort((a,b)=>a.start-b.start||a.resourceInstance.localeCompare(b.resourceInstance)).map(x=>({id:x.id,batchNo:x.batchRef,sourceKind:x.sourceKind,baseResourceCode:x.baseResourceCode,resourceInstance:x.resourceInstance,resourceLabel:capacityResource(model,x.baseResourceCode).label,mainOperationCode:x.mainOperationCode,recipeNo:x.recipeNo,startAt:wallIso(x.start)!,endAt:wallIso(x.end)!,durationMinutes:Math.round((x.end-x.start)/60_000),segmentKind:x.segmentKind,segmentLabel:x.segmentLabel,status:x.status,jobs:x.jobs,surfaceDm2:x.surfaceDm2,occupiesCapacity:x.occupiesCapacity,capacityUnits:Math.max(1,x.capacityUnits||1)}));
 }
 function resourceSummary(state:OccupancyState,nodes:BatchNode[],model:CapacityModel,startAt:number,cutoff:number):CapacityResourceSummary[]{
   const defs=[...model.resourceList];const usedCodes=new Set(state.intervals.map(x=>key(x.baseResourceCode)));for(const c of usedCodes)if(!defs.some(d=>key(d.baseResourceCode)===c))defs.push(capacityResource(model,c));
   return defs.sort((a,b)=>a.sortOrder-b.sortOrder||a.code.localeCompare(b.code)).map(def=>{
     const intervals=state.intervals.filter(x=>key(x.baseResourceCode)===key(def.baseResourceCode));const capacityIntervals=intervals.filter(x=>x.occupiesCapacity);
-    const existing=capacityIntervals.filter(x=>x.sourceKind==="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0);
-    const simulated=capacityIntervals.filter(x=>x.sourceKind!=="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0);
+    const existing=capacityIntervals.filter(x=>x.sourceKind==="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff)*Math.max(1,x.capacityUnits||1),0);
+    const simulated=capacityIntervals.filter(x=>x.sourceKind!=="EXISTING_SCHEDULE").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff)*Math.max(1,x.capacityUnits||1),0);
     const isChemical=model.chemicalLine.enabled&&key(def.baseResourceCode)===key(model.chemicalLine.resourceCode);
     const available=Math.max(0,(cutoff-startAt)/60_000*(isChemical?def.instanceCount:def.maxConcurrent));
     const processExisting=isChemical?intervals.filter(x=>x.sourceKind==="EXISTING_SCHEDULE"&&model.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK").reduce((sum,x)=>sum+clipMinutes(x.start,x.end,startAt,cutoff),0):0;
@@ -568,10 +749,20 @@ function resourceSummary(state:OccupancyState,nodes:BatchNode[],model:CapacityMo
 }
 
 async function simulate(rows:StOutputJobAssessment[],candidateIds:Set<number>,rawMap:Map<number,RawContext>,planningModel:PlanningModel,batchModel:Awaited<ReturnType<typeof getBatchModel>>,capacityModel:CapacityModel,recipeModel:RecipeModel,baseOccupancy:OccupancyState,scenarioStart:number,cutoff:number,horizonEnd:number):Promise<Simulation>{
-  const chains=buildChains(rows,rawMap,planningModel,batchModel,capacityModel);const {nodes,memberNode}=buildNodes(chains,capacityModel);const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,recipeModel,scenarioStart,horizonEnd);const jobs=evaluateJobs(chains,nodes,memberNode,scenarioStart,cutoff);const feasiblePlannedSurface=jobs.filter(x=>x.sourceStatus==="PLANNED"&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const feasibleCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const selectedCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)).reduce((s,x)=>s+x.surfaceDm2,0);const warnings:string[]=[];if(chains.some(x=>x.capacityReview))warnings.push("UNMAPPED_AREA_CAPACITY_REVIEW");if(nodes.some(x=>x.status==="UNSCHEDULED"))warnings.push("ONE_OR_MORE_BATCHES_HAVE_NO_CAPACITY_SLOT");if(nodes.some(x=>x.status==="DEPENDENCY_CONFLICT"))warnings.push("SCHEDULE_PRECEDENCE_CONFLICT");if(capacityModel.chemicalLine.enabled&&baseOccupancy.intervals.some(x=>key(x.baseResourceCode)===key(capacityModel.chemicalLine.resourceCode))&&capacityModel.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")warnings.push("EXISTING_CHEMICAL_SCHEDULE_IS_TREATED_AS_CONSERVATIVE_PROCESS_OCCUPANCY");return{nodes,jobs,timeline:timelineRows(state,capacityModel,scenarioStart,horizonEnd),resources:resourceSummary(state,nodes,capacityModel,scenarioStart,cutoff),feasiblePlannedSurface,feasibleCandidateSurface,selectedCandidateSurface,warnings};
+  const chains=buildChains(rows,rawMap,planningModel,batchModel,capacityModel);const {nodes,memberNode}=buildNodes(chains,capacityModel);const state=scheduleNodes(nodes,memberNode,baseOccupancy,capacityModel,recipeModel,scenarioStart,horizonEnd);const jobs=evaluateJobs(chains,nodes,memberNode,scenarioStart,cutoff);const feasiblePlannedSurface=jobs.filter(x=>x.sourceStatus==="PLANNED"&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const feasibleCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)&&x.contributes).reduce((s,x)=>s+x.surfaceDm2,0);const selectedCandidateSurface=jobs.filter(x=>candidateIds.has(x.planningJobId)).reduce((s,x)=>s+x.surfaceDm2,0);const warnings:string[]=[];if(chains.some(x=>x.capacityReview))warnings.push("UNMAPPED_AREA_CAPACITY_REVIEW");if(nodes.some(x=>x.status==="UNSCHEDULED"))warnings.push("ONE_OR_MORE_BATCHES_HAVE_NO_CAPACITY_SLOT");if(nodes.some(x=>x.status==="DEPENDENCY_CONFLICT"))warnings.push("SCHEDULE_PRECEDENCE_CONFLICT");if(capacityModel.chemicalLine.enabled&&baseOccupancy.intervals.some(x=>key(x.baseResourceCode)===key(capacityModel.chemicalLine.resourceCode))&&capacityModel.chemicalLine.existingSchedulePolicy==="CONSERVATIVE_PROCESS_BLOCK")warnings.push("EXISTING_CHEMICAL_SCHEDULE_IS_TREATED_AS_CONSERVATIVE_PROCESS_OCCUPANCY");if(capacityModel.manualWork.enabled&&nodes.some(x=>isManualWorkNode(x,capacityModel)))warnings.push("MASKING_UNMASKING_WORKSTATION_AND_LABOR_CAPACITY_ACTIVE");return{nodes,jobs,timeline:timelineRows(state,capacityModel,scenarioStart,horizonEnd),resources:resourceSummary(state,nodes,capacityModel,scenarioStart,cutoff),feasiblePlannedSurface,feasibleCandidateSurface,selectedCandidateSurface,warnings};
 }
 
-function nodeToPublic(node:BatchNode):ProposedCapacityBatch{return{id:node.id,batchNo:node.batchNo,sourceKind:node.sourceKind,mainOperationCode:node.mainOperation.code,mainOperationLabel:node.mainOperation.label,batchKey:node.batchKey,recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),totalQty:node.members.reduce((s,x)=>s+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((s,x)=>s+x.row.surfaceDm2,0),durationMinutes:node.durationMinutes,batchRuleCode:node.ruleCode,resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,startAt:wallIso(node.start),endAt:wallIso(node.end),mustStartBy:wallIso(node.mustStartBy),status:node.status,reason:node.reason,warnings:node.warnings,segments:node.segments.map(seg=>({kind:seg.kind,label:seg.label,startAt:wallIso(seg.start)!,endAt:wallIso(seg.end)!,durationMinutes:Math.round((seg.end-seg.start)/60_000),occupiesCapacity:seg.occupiesCapacity}))};}
+function nodeToPublic(node:BatchNode):ProposedCapacityBatch{
+  const prerequisiteJobs=[...new Set(node.prerequisiteManualBatches.flatMap(x=>x.jobs))];
+  return{
+    id:node.id,batchNo:node.batchNo,sourceKind:node.sourceKind,mainOperationCode:node.mainOperation.code,mainOperationLabel:node.mainOperation.label,batchKey:node.batchKey,
+    recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),totalQty:node.members.reduce((s,x)=>s+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((s,x)=>s+x.row.surfaceDm2,0),
+    durationMinutes:node.durationMinutes,batchRuleCode:node.ruleCode,resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,startAt:wallIso(node.start),endAt:wallIso(node.end),mustStartBy:wallIso(node.mustStartBy),
+    batchReadyAt:wallIso(node.batchReadyAt),prerequisiteManualBatchCount:node.prerequisiteManualBatches.length,prerequisiteManualJobCount:prerequisiteJobs.length,prerequisiteManualLoadMinutes:node.prerequisiteManualLoadMinutes,prerequisiteManualCompleteAt:wallIso(node.prerequisiteManualCompleteAt),
+    prerequisiteManualBatches:node.prerequisiteManualBatches.map(x=>({batchNo:x.batchNo,mainOperationCode:x.mainOperationCode,operationCodes:x.operationCodes,jobs:x.jobs,loadMinutes:x.loadMinutes,elapsedMinutes:x.start!=null&&x.end!=null?Math.max(0,Math.round((x.end-x.start)/60_000)):null,startAt:wallIso(x.start),endAt:wallIso(x.end)})),
+    status:node.status,reason:node.reason,warnings:node.warnings,segments:node.segments.map(seg=>({kind:seg.kind,label:seg.label,startAt:wallIso(seg.start)!,endAt:wallIso(seg.end)!,durationMinutes:Math.round((seg.end-seg.start)/60_000),occupiesCapacity:seg.occupiesCapacity}))
+  };
+}
 
 export async function calculateFiniteCapacityTarget(options:FiniteCapacityOptions):Promise<FiniteCapacityResult>{
   const [base,planningModel,batchModel,capacityModel,recipeModel,bootstrap]=await Promise.all([

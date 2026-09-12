@@ -60,6 +60,34 @@ export type PaintingCapacityModel = {
   rules: PaintingCapacityRule[];
 };
 
+
+export type ManualCapacityRule = {
+  code: string;
+  name: string;
+  priority: number;
+  condition: JsonMap;
+  action: JsonMap;
+};
+
+export type ManualWorkCapacityModel = {
+  enabled: boolean;
+  mainOperationCodes: string[];
+  maskingResourceCode: string;
+  unmaskingResourceCode: string;
+  maskingLaborResourceCode: string;
+  unmaskingLaborResourceCode: string;
+  setupAggregation: "MAX_MEMBER" | "SUM_MEMBER" | "FIXED";
+  maskingDefaultSetupMinutes: number;
+  unmaskingDefaultSetupMinutes: number;
+  defaultReleaseMinutes: number;
+  defaultMaxOperatorsPerBatch: number;
+  defaultOperator2ThresholdWorkMinutes: number;
+  defaultParallelEfficiency: number;
+  routeAwareGrouping: boolean;
+  routeContextMode: "PREV_NEXT_MAIN" | "NEXT_MAIN" | "SOURCE_OPERATION_ONLY";
+  rules: ManualCapacityRule[];
+};
+
 export type CapacityModel = {
   resources: Record<string, CapacityResourceDefinition>;
   resourceList: CapacityResourceDefinition[];
@@ -73,8 +101,11 @@ export type CapacityModel = {
   proposedBatchPrefix: string;
   unmappedResourcePolicy: "BLOCK" | "REVIEW_UNCONSTRAINED";
   groupBySourceOperation: boolean;
+  mainBatchGateMode: "ALL_MEMBER_ROUTE_READY";
+  manualPrerequisiteGateMode: "CONSECUTIVE_ROUTE_MANUAL_CHAIN";
   chemicalLine: ChemicalLineCapacityModel;
   painting: PaintingCapacityModel;
+  manualWork: ManualWorkCapacityModel;
 };
 
 function record(value: unknown): JsonMap {
@@ -102,6 +133,7 @@ export async function getCapacityModel(): Promise<CapacityModel> {
     spillHours: 24, candidateSurfaceMultiplier: 1.5, maxCandidateJobs: 250,
     includeExistingSchedule: true, proposedBatchPrefix: "PROP",
     unmappedResourcePolicy: "REVIEW_UNCONSTRAINED", groupBySourceOperation: true,
+    mainBatchGateMode: "ALL_MEMBER_ROUTE_READY", manualPrerequisiteGateMode: "CONSECUTIVE_ROUTE_MANUAL_CHAIN",
     chemicalLine: {
       enabled: true, resourceCode: "FLYBAR", processMaxConcurrent: 3, ndtRecipeNos: ["001","009","016","025"],
       ndtMinutes: 300, ndtStartSpacingMinutes: 90, loadingDefaultMinutes: 30, loadingHeavyMinutes: 45,
@@ -115,6 +147,15 @@ export async function getCapacityModel(): Promise<CapacityModel> {
       setupMinutes: 30, flashMinutes: 30, cureMinutes: 60, releaseMinutes: 15, useRecipeStages: true,
       flashOccupiesCabin: true, cureOccupiesCabin: true, releaseOccupiesCabin: true,
       existingSchedulePolicy: "CONSERVATIVE_FULL_BLOCK", rules: [],
+    },
+    manualWork: {
+      enabled: true,
+      mainOperationCodes: ["MASKING","FMSKG_CM","UNMASKING"],
+      maskingResourceCode: "MASKING", unmaskingResourceCode: "UNMASKING",
+      maskingLaborResourceCode: "MASKING_LABOR", unmaskingLaborResourceCode: "UNMASKING_LABOR",
+      setupAggregation: "MAX_MEMBER", maskingDefaultSetupMinutes: 10, unmaskingDefaultSetupMinutes: 5,
+      defaultReleaseMinutes: 5, defaultMaxOperatorsPerBatch: 2, defaultOperator2ThresholdWorkMinutes: 240,
+      defaultParallelEfficiency: 0.85, routeAwareGrouping: true, routeContextMode: "PREV_NEXT_MAIN", rules: [],
     },
   };
   try {
@@ -134,10 +175,22 @@ export async function getCapacityModel(): Promise<CapacityModel> {
           SELECT jsonb_agg(to_jsonb(r) ORDER BY r.priority, r.code)
           FROM config_rules r
           WHERE r.enabled=true AND r.rule_type='PAINT_CAPACITY'
-        ), '[]'::jsonb) AS paint_rules`);
+        ), '[]'::jsonb) AS paint_rules,
+        COALESCE((
+          SELECT jsonb_agg(to_jsonb(r) ORDER BY r.priority, r.code)
+          FROM config_rules r
+          WHERE r.enabled=true AND r.rule_type='MANUAL_CAPACITY'
+        ), '[]'::jsonb) AS manual_rules`);
     const row = (result.rows[0] || {}) as Record<string, unknown>;
     const settings = record(row.settings);
     const paintRules = ((Array.isArray(row.paint_rules) ? row.paint_rules : []) as Record<string, unknown>[]).map((r) => ({
+      code: String(r.code || ""),
+      name: String(r.name || r.code || ""),
+      priority: Number(r.priority || 100),
+      condition: record(r.condition_json),
+      action: record(r.action_json),
+    }));
+    const manualRules = ((Array.isArray(row.manual_rules) ? row.manual_rules : []) as Record<string, unknown>[]).map((r) => ({
       code: String(r.code || ""),
       name: String(r.name || r.code || ""),
       priority: Number(r.priority || 100),
@@ -172,6 +225,8 @@ export async function getCapacityModel(): Promise<CapacityModel> {
       proposedBatchPrefix: text(settings["capacity.proposedBatchPrefix"], defaults.proposedBatchPrefix),
       unmappedResourcePolicy: key(settings["capacity.unmappedResourcePolicy"]) === "BLOCK" ? "BLOCK" : "REVIEW_UNCONSTRAINED",
       groupBySourceOperation: bool(settings["capacity.groupBySourceOperation"], defaults.groupBySourceOperation),
+      mainBatchGateMode: key(settings["capacity.mainBatchGateMode"]) === "ALL_MEMBER_ROUTE_READY" ? "ALL_MEMBER_ROUTE_READY" : defaults.mainBatchGateMode,
+      manualPrerequisiteGateMode: key(settings["capacity.manualPrerequisiteGateMode"]) === "CONSECUTIVE_ROUTE_MANUAL_CHAIN" ? "CONSECUTIVE_ROUTE_MANUAL_CHAIN" : defaults.manualPrerequisiteGateMode,
       chemicalLine: {
         enabled: bool(settings["capacity.chemicalLineSegmented"], defaults.chemicalLine.enabled),
         resourceCode: text(settings["capacity.chemicalLineResourceCode"], defaults.chemicalLine.resourceCode),
@@ -203,6 +258,24 @@ export async function getCapacityModel(): Promise<CapacityModel> {
         releaseOccupiesCabin: bool(settings["capacity.paintingReleaseOccupiesCabin"], defaults.painting.releaseOccupiesCabin),
         existingSchedulePolicy: key(settings["capacity.paintingExistingSchedulePolicy"]) === "PHYSICAL_ONLY" ? "PHYSICAL_ONLY" : "CONSERVATIVE_FULL_BLOCK",
         rules: paintRules,
+      },
+      manualWork: {
+        enabled: bool(settings["capacity.manualWorkSegmented"], defaults.manualWork.enabled),
+        mainOperationCodes: stringArray(settings["capacity.manualWorkMainOperations"], defaults.manualWork.mainOperationCodes),
+        maskingResourceCode: text(settings["capacity.maskingResourceCode"], defaults.manualWork.maskingResourceCode),
+        unmaskingResourceCode: text(settings["capacity.unmaskingResourceCode"], defaults.manualWork.unmaskingResourceCode),
+        maskingLaborResourceCode: text(settings["capacity.maskingLaborResourceCode"], defaults.manualWork.maskingLaborResourceCode),
+        unmaskingLaborResourceCode: text(settings["capacity.unmaskingLaborResourceCode"], defaults.manualWork.unmaskingLaborResourceCode),
+        setupAggregation: key(settings["capacity.manualSetupAggregation"]) === "SUM_MEMBER" ? "SUM_MEMBER" : key(settings["capacity.manualSetupAggregation"]) === "FIXED" ? "FIXED" : "MAX_MEMBER",
+        maskingDefaultSetupMinutes: Math.max(0, num(settings["capacity.maskingDefaultSetupMinutes"], defaults.manualWork.maskingDefaultSetupMinutes)),
+        unmaskingDefaultSetupMinutes: Math.max(0, num(settings["capacity.unmaskingDefaultSetupMinutes"], defaults.manualWork.unmaskingDefaultSetupMinutes)),
+        defaultReleaseMinutes: Math.max(0, num(settings["capacity.manualReleaseMinutes"], defaults.manualWork.defaultReleaseMinutes)),
+        defaultMaxOperatorsPerBatch: Math.max(1, Math.min(16, Math.trunc(num(settings["capacity.manualMaxOperatorsPerBatch"], defaults.manualWork.defaultMaxOperatorsPerBatch)))),
+        defaultOperator2ThresholdWorkMinutes: Math.max(1, num(settings["capacity.manualOperator2ThresholdWorkMinutes"], defaults.manualWork.defaultOperator2ThresholdWorkMinutes)),
+        defaultParallelEfficiency: Math.max(0.1, Math.min(1, num(settings["capacity.manualParallelEfficiency"], defaults.manualWork.defaultParallelEfficiency))),
+        routeAwareGrouping: bool(settings["capacity.manualRouteAwareGrouping"], defaults.manualWork.routeAwareGrouping),
+        routeContextMode: key(settings["capacity.manualRouteContextMode"]) === "NEXT_MAIN" ? "NEXT_MAIN" : key(settings["capacity.manualRouteContextMode"]) === "SOURCE_OPERATION_ONLY" ? "SOURCE_OPERATION_ONLY" : "PREV_NEXT_MAIN",
+        rules: manualRules,
       },
     };
   } catch {

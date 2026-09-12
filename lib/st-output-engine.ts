@@ -18,6 +18,9 @@ type BatchAssignment = {
   endTime: string | null;
   scheduleDurationMinutes: number | null;
   scheduleStatus: string | null;
+  routePosition: number | null;
+  sourceOperation: string | null;
+  nextPlanningOperation: string | null;
 };
 
 export type StOutputStep = {
@@ -170,11 +173,18 @@ function batchQueues(assignments: BatchAssignment[]): Map<string, BatchAssignmen
   for (const arr of out.values()) arr.sort((a,b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   return out;
 }
-function takeBatch(main: MainOperationDefinition | null, queues: Map<string, BatchAssignment[]>): BatchAssignment | null {
+function takeBatch(main: MainOperationDefinition | null, operationCode: string, routePosition: number, queues: Map<string, BatchAssignment[]>): BatchAssignment | null {
   if (!main) return null;
   const arr = queues.get(key(main.code));
   if (!arr?.length) return null;
-  return arr.shift() || null;
+  const op = key(operationCode);
+  // Route-safe priority: exact route position > exact source operation > generic main-operation fallback.
+  // This prevents repeated MASKING/UNMASKING (or any repeated Main Operation) from being attached to the wrong route occurrence.
+  let index = arr.findIndex((x)=>x.routePosition != null && x.routePosition === routePosition);
+  if (index < 0) index = arr.findIndex((x)=>key(x.sourceOperation) === op);
+  if (index < 0) index = 0;
+  const [picked] = arr.splice(index,1);
+  return picked || null;
 }
 
 function evaluateActual(
@@ -293,7 +303,7 @@ function assessJob(
       qty: numberOrNull(row.prod_qty),
       surfaceDm2,
     });
-    const batch = takeBatch(main, queues);
+    const batch = takeBatch(main, op.code, op.position, queues);
     const batchMinutes = batch?.processTimeMinutes;
     let duration = batchMinutes != null ? batchMinutes : process.minutes;
     let basis: StOutputStep["durationBasis"] = batchMinutes != null ? "BATCH" : process.minutes != null ? "PROCESS_TIME_RULE" : outputModel.unknownStepPolicy === "BLOCK" ? "UNKNOWN_BLOCK" : "UNKNOWN_ZERO";
@@ -433,6 +443,9 @@ export async function calculateStOutputTarget(options: StOutputTargetOptions): P
   if(jobNums.length){
     const batches=await query(`
       SELECT j.job_num,b.batch_no,b.main_operation_code,b.status,b.process_time_minutes,b.created_at,
+             NULLIF(j.candidate_snapshot->>'routePosition','')::integer AS route_position,
+             COALESCE(NULLIF(j.candidate_snapshot->>'nextStOperation',''),NULLIF(j.candidate_snapshot->>'nextOperation','')) AS source_operation,
+             NULLIF(j.candidate_snapshot->>'nextPlanningOperation','') AS next_planning_operation,
              s.schedule_date,s.start_time,s.end_time,s.duration_minutes AS schedule_duration_minutes,s.status AS schedule_status
       FROM planning_batch_jobs j
       JOIN planning_batches b ON b.id=j.batch_id
@@ -444,7 +457,7 @@ export async function calculateStOutputTarget(options: StOutputTargetOptions): P
       ) s ON true
       WHERE j.job_num=ANY($1::text[]) AND b.status<>'CANCELLED'
       ORDER BY j.job_num,b.created_at DESC`,[jobNums]);
-    for(const x of batches.rows as Record<string,unknown>[]){const job=String(x.job_num||"");const arr=batchMap.get(job)||[];arr.push({batchNo:String(x.batch_no||""),mainOperationCode:String(x.main_operation_code||""),status:String(x.status||""),processTimeMinutes:numberOrNull(x.process_time_minutes),createdAt:String(x.created_at||""),scheduleDate:x.schedule_date==null?null:String(x.schedule_date).slice(0,10),startTime:x.start_time==null?null:String(x.start_time),endTime:x.end_time==null?null:String(x.end_time),scheduleDurationMinutes:numberOrNull(x.schedule_duration_minutes),scheduleStatus:x.schedule_status==null?null:String(x.schedule_status)});batchMap.set(job,arr);}
+    for(const x of batches.rows as Record<string,unknown>[]){const job=String(x.job_num||"");const arr=batchMap.get(job)||[];arr.push({batchNo:String(x.batch_no||""),mainOperationCode:String(x.main_operation_code||""),status:String(x.status||""),processTimeMinutes:numberOrNull(x.process_time_minutes),createdAt:String(x.created_at||""),scheduleDate:x.schedule_date==null?null:String(x.schedule_date).slice(0,10),startTime:x.start_time==null?null:String(x.start_time),endTime:x.end_time==null?null:String(x.end_time),scheduleDurationMinutes:numberOrNull(x.schedule_duration_minutes),scheduleStatus:x.schedule_status==null?null:String(x.schedule_status),routePosition:numberOrNull(x.route_position),sourceOperation:x.source_operation==null?null:String(x.source_operation),nextPlanningOperation:x.next_planning_operation==null?null:String(x.next_planning_operation)});batchMap.set(job,arr);}
   }
   const assessed=rows.map((row)=>assessJob(row,opMap.get(Number(row.route_id))||[],batchMap.get(String(row.job_num||""))||[],planningModel,recipeModel,outputModel,options.targetDate,options.cutoffTime));
   const filtered=options.status?.trim()?assessed.filter((x)=>x.outputStatus===options.status):assessed;

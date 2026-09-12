@@ -169,7 +169,8 @@ export async function POST(request: Request) {
             process_time_minutes,sequence_order,candidate_snapshot
           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)`,
           [batchId,c.planningJobId,c.jobNum,c.part,c.revision,c.program,c.qty,c.surfaceDm2,c.recipeSuggestion.recipeNo,c.recipeSuggestion.recipeName||c.recipeSuggestion.sourceValue,c.processTimeSuggestion.minutes,i+1,JSON.stringify({
-            nextOperation:c.nextOperation,nextStOperation:c.nextStOperation,nextPlanningOperation:c.nextPlanningOperation,
+            nextOperation:c.nextOperation,nextStOperation:c.nextStOperation,routePosition:c.routePosition,
+            nextPlanningOperation:c.nextPlanningOperation?.code || null,
             recipeSuggestion:c.recipeSuggestion,processTimeSuggestion:c.processTimeSuggestion,batchProposal:c.batchProposal,
           })]
         );
