@@ -1,0 +1,12 @@
+v026.2 verification checklist
+
+1. Run db/41_commitment_lifecycle_audit_v026_2.sql once. It contains exactly 10 SQL statements.
+2. Run db/verify_v026_2_commitment.sql. It contains 5 read-only queries.
+3. Open BAT-30 and create a DRAFT batch from one eligible Job.
+4. Verify Planning Batches shows Version 1 and active/total commitment count.
+5. Change DRAFT -> READY. Version must increment to 2 and audit must show BATCH_STATUS_CHANGED.
+6. Try an invalid direct transition DRAFT -> STARTED: server must reject it.
+7. Open the same Batch in two browser tabs. Change status in tab A; then save stale tab B. Tab B must receive stale-version conflict and refresh.
+8. The same Job + Main Operation must not be committed into two active Batches concurrently.
+9. COMPLETE/CANCELLED releases Candidate blocking for that Job + Main.
+10. CFG-93 Status editor must retain allowed transitions / blocksCandidate / allowDelete / terminal when saving.

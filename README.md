@@ -1,3 +1,16 @@
+# ST Planning v026.2 — ERP Commitment Ledger
+
+Current production baseline: **v026.2**.
+
+- ERP State Kernel: v026.1
+- Commitment Ledger + Lifecycle + Audit: v026.2
+- ST Output Target forecast: v025.5
+- What-if optimizer: v024
+
+Deployment note: run `db/41_commitment_lifecycle_audit_v026_2.sql` once when upgrading from v026.1. The migration contains exactly 10 SQL statements. See `README_V0262_COMMITMENT_LEDGER.md`.
+
+---
+
 # ST Planning Clean Rebuild v024
 
 ## What-if / Target Optimizer

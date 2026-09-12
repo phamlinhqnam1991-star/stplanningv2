@@ -25,6 +25,9 @@ export type CandidateRow = {
   routeAnchorConfidence: "HIGH" | "MEDIUM" | "LOW" | "NONE";
   routeWarnings: string[];
   routeOperationCount: number | null;
+  planningSourceOperation: string | null;
+  planningRoutePosition: number | null;
+  planningOccurrenceKey: string | null;
   nextPlanningOperation: ReturnType<typeof classifyOperationRoute>["nextPlanningOperation"];
   recipeSuggestion: ReturnType<typeof resolveRecipe>;
   processTimeSuggestion: ReturnType<typeof resolveProcessTime>;
@@ -38,6 +41,18 @@ type LoadOptions = {
   planningJobIds?: number[];
   scanLimit?: number;
 };
+
+
+function operationOccurrenceKey(operations: RouteOperationForAnalysis[], target: RouteOperationForAnalysis | null): string | null {
+  if (!target) return null;
+  const sorted=[...operations].sort((a,b)=>a.position-b.position);
+  let occurrence=0;
+  for (const op of sorted) {
+    if (String(op.code||"").trim().toUpperCase()===String(target.code||"").trim().toUpperCase()) occurrence+=1;
+    if (op.position===target.position) return `${target.code}#${occurrence}`;
+  }
+  return null;
+}
 
 function addLike(params: unknown[], value: string) {
   params.push(`%${value}%`);
@@ -125,9 +140,16 @@ export async function loadCandidateRows(options: LoadOptions = {}): Promise<Cand
       ? classifyOperationRoute(routeAnalysis.remainingStRoute.map((op) => op.code), planningModel)
       : null;
     const nextPlanning = planningClassification?.nextPlanningOperation || null;
-    const nextPlanningSourceOperation = nextPlanning
-      ? planningClassification?.steps.find((step) => step.planningEnabled && step.mainOperationCode === nextPlanning.code)?.sourceOperation || routeAnalysis?.nextStOperation || null
+    const nextPlanningStepIndex = nextPlanning
+      ? (planningClassification?.steps.findIndex((step) => step.planningEnabled && step.mainOperationCode === nextPlanning.code) ?? -1)
+      : -1;
+    const nextPlanningSourceOperation = nextPlanningStepIndex >= 0
+      ? planningClassification?.steps[nextPlanningStepIndex]?.sourceOperation || routeAnalysis?.nextStOperation || null
       : routeAnalysis?.nextStOperation || null;
+    const planningRouteOperation = nextPlanningStepIndex >= 0
+      ? routeAnalysis?.remainingStRoute[nextPlanningStepIndex] || null
+      : null;
+    const planningOccurrenceKey = operationOccurrenceKey(routeOperations, planningRouteOperation);
     const recipe = resolveRecipe(nextPlanning?.code || null, row.raw_row_data, recipeModel);
     const processTime = resolveProcessTime(nextPlanning?.code || null, row.raw_row_data, recipe, recipeModel, {
       operationCode: nextPlanningSourceOperation,
@@ -156,24 +178,47 @@ export async function loadCandidateRows(options: LoadOptions = {}): Promise<Cand
       routeAnchorConfidence: routeAnalysis?.anchorConfidence || "NONE",
       routeWarnings: routeAnalysis?.anchorWarnings || [],
       routeOperationCount: row.route_operation_count == null ? null : Number(row.route_operation_count),
+      planningSourceOperation: nextPlanningSourceOperation,
+      planningRoutePosition: planningRouteOperation?.position ?? null,
+      planningOccurrenceKey,
       nextPlanningOperation: nextPlanning, recipeSuggestion: recipe, processTimeSuggestion: processTime, batchProposal: proposal,
     });
   }
   if (out.length) {
-    const ids = out.map((x) => x.planningJobId);
     const blockingStatuses = batchModel.statuses
       .filter((status: BatchModel["statuses"][number]) => status.data.blocksCandidate !== false)
       .map((status: BatchModel["statuses"][number]) => status.code);
-    const open = blockingStatuses.length ? await query<{ planning_job_id: string }>(`
-      SELECT DISTINCT j.planning_job_id::text AS planning_job_id
-      FROM planning_batch_jobs j
-      JOIN planning_batches b ON b.id=j.batch_id
-      WHERE j.planning_job_id = ANY($1::bigint[])
-        AND b.status = ANY($2::text[])`, [ids, blockingStatuses]) : { rows: [] };
-    const blocked = new Set(open.rows.map((x) => Number(x.planning_job_id)));
+    const jobNums=[...new Set(out.map((row)=>row.jobNum).filter(Boolean))];
+    const blockedPairs=new Set<string>();
+    if (jobNums.length && blockingStatuses.length) {
+      // v026.2 canonical Commitment Ledger. Keep the legacy Batch join in the same
+      // query so upgraded databases remain correct even before every historical
+      // Batch has a backfilled commitment row.
+      const open=await query<{job_num:string;main_operation_code:string}>(`
+        SELECT DISTINCT x.job_num,x.main_operation_code
+        FROM (
+          SELECT c.job_num,c.main_operation_code
+          FROM erp_job_commitments c
+          WHERE c.state='ACTIVE' AND upper(btrim(c.job_num)) = ANY($1::text[])
+          UNION
+          SELECT j.job_num,b.main_operation_code
+          FROM planning_batch_jobs j
+          JOIN planning_batches b ON b.id=j.batch_id
+          WHERE upper(btrim(j.job_num)) = ANY($1::text[])
+            AND b.status = ANY($2::text[])
+        ) x`, [jobNums.map((job)=>job.trim().toUpperCase()),blockingStatuses]);
+      for(const row of open.rows) blockedPairs.add(`${String(row.job_num||"").trim().toUpperCase()}|${String(row.main_operation_code||"").trim().toUpperCase()}`);
+    }
     for (const row of out) {
-      if (!blocked.has(row.planningJobId)) continue;
-      row.batchProposal = { ...row.batchProposal, eligible:false, eligibilityReason:"Job already belongs to an open batch.", warnings:[...row.batchProposal.warnings,"OPEN_BATCH_EXISTS"] };
+      const main=row.nextPlanningOperation?.code||"";
+      const pair=`${row.jobNum.trim().toUpperCase()}|${main.trim().toUpperCase()}`;
+      if (!main || !blockedPairs.has(pair)) continue;
+      row.batchProposal = {
+        ...row.batchProposal,
+        eligible:false,
+        eligibilityReason:`Job already has an active commitment for ${main}.`,
+        warnings:[...row.batchProposal.warnings,"ACTIVE_COMMITMENT_EXISTS"],
+      };
     }
   }
   return options.eligibleOnly ? out.filter((row) => row.batchProposal.eligible) : out;
