@@ -1,6 +1,7 @@
 import type { PoolClient } from "pg";
 import type { BatchModel } from "@/lib/batch-model";
 import { ErpConflictError, validateStatusTransition, writeAuditEvent } from "@/lib/commitment-ledger";
+import { wallDateFromInstant, wallTimestampFromInstant } from "@/lib/plant-time";
 
 export type ScheduleReservationState = "ACTIVE" | "CANCELLED" | "COMPLETED";
 export type ScheduleReservationSource = "MANUAL" | "PROPOSAL_ACCEPT" | "SYSTEM_RECOVERY";
@@ -73,14 +74,33 @@ function assertExpectedVersion(actual: number, expected?: number | null) {
   }
 }
 
-async function assertNoExactResourceOverlap(
+export type ResourceReservationConflict = {
+  source: "ERP" | "IMPORTED";
+  id: string;
+  batch_no: string;
+  start_at: string;
+  end_at: string;
+};
+
+async function plantTimezoneOffsetMinutes(client: PoolClient): Promise<number> {
+  const result = await client.query<{ offset_minutes: number }>(`
+    SELECT COALESCE((value_json #>> '{}')::numeric,420)::int AS offset_minutes
+      FROM config_settings
+     WHERE setting_key='stOutput.timezoneOffsetMinutes' AND enabled=true
+     LIMIT 1`);
+  const value = Number(result.rows[0]?.offset_minutes ?? 420);
+  return Number.isFinite(value) ? Math.max(-840, Math.min(840, value)) : 420;
+}
+
+export async function findResourceReservationConflicts(
   client: PoolClient,
   resourceCode: string,
   startAt: string,
   endAt: string,
-  excludeReservationId?: string | null,
-) {
-  const result = await client.query<{ id: string; batch_no: string; start_at: string; end_at: string }>(`
+  options: { excludeReservationId?: string | null; excludeBatchId?: string | null } = {},
+): Promise<ResourceReservationConflict[]> {
+  const conflicts: ResourceReservationConflict[] = [];
+  const erp = await client.query<{ id: string; batch_no: string; start_at: string; end_at: string }>(`
     SELECT id::text,batch_no,start_at::text,end_at::text
     FROM erp_schedule_reservations
     WHERE state='ACTIVE'
@@ -88,13 +108,61 @@ async function assertNoExactResourceOverlap(
       AND start_at < $3::timestamptz
       AND end_at > $2::timestamptz
       AND ($4::uuid IS NULL OR id<>$4::uuid)
+      AND ($5::uuid IS NULL OR batch_id<>$5::uuid)
     ORDER BY start_at
-    LIMIT 10`, [resourceCode, startAt, endAt, excludeReservationId || null]);
-  if (result.rows.length) {
+    LIMIT 20`, [resourceCode, startAt, endAt, options.excludeReservationId || null, options.excludeBatchId || null]);
+  conflicts.push(...erp.rows.map((row) => ({ source:"ERP" as const, ...row })));
+
+  // Imported schedule is the current read-only production baseline. Production
+  // reservations must respect it even when What-if is allowed to ignore it.
+  const offset = await plantTimezoneOffsetMinutes(client);
+  const startWall = wallTimestampFromInstant(startAt, offset);
+  const endWall = wallTimestampFromInstant(endAt, offset);
+  const imported = await client.query<{ id: string; batch_no: string; start_at: string; end_at: string }>(`
+    WITH imported AS (
+      SELECT s.id::text AS id,
+             COALESCE(NULLIF(a.batch_ref,''),NULLIF(s.batch_ref,''),'IMPORTED') AS batch_no,
+             (s.schedule_date + s.start_time)::timestamp AS start_wall,
+             CASE
+               WHEN s.end_time IS NOT NULL THEN
+                 (s.schedule_date + s.end_time)::timestamp
+                 + CASE WHEN s.end_time<=s.start_time THEN interval '1 day' ELSE interval '0 day' END
+               WHEN s.duration_minutes IS NOT NULL THEN
+                 (s.schedule_date + s.start_time)::timestamp + (s.duration_minutes * interval '1 minute')
+               ELSE NULL
+             END AS end_wall
+        FROM v_active_schedule_resource_assignments a
+        JOIN v_active_schedule_blocks s ON s.id=a.schedule_block_id
+       WHERE upper(btrim(a.resource_code))=upper(btrim($1))
+         AND s.schedule_date IS NOT NULL
+         AND s.start_time IS NOT NULL
+    )
+    SELECT id,batch_no,start_wall::text AS start_at,end_wall::text AS end_at
+      FROM imported
+     WHERE end_wall IS NOT NULL
+       AND start_wall<$3::timestamp
+       AND end_wall>$2::timestamp
+     ORDER BY start_wall
+     LIMIT 20`, [resourceCode, startWall, endWall]);
+  conflicts.push(...imported.rows.map((row) => ({ source:"IMPORTED" as const, ...row })));
+  return conflicts;
+}
+
+async function assertNoResourceOverlap(
+  client: PoolClient,
+  resourceCode: string,
+  startAt: string,
+  endAt: string,
+  excludeReservationId?: string | null,
+  excludeBatchId?: string | null,
+) {
+  const conflicts = await findResourceReservationConflicts(client, resourceCode, startAt, endAt, { excludeReservationId, excludeBatchId });
+  if (conflicts.length) {
+    const first = conflicts[0];
     throw new ErpConflictError(
-      "RESOURCE_TIME_OVERLAP",
-      `${resourceCode} is already reserved by ${result.rows[0].batch_no} during the requested time.`,
-      { resourceCode, conflicts: result.rows },
+      first.source === "IMPORTED" ? "IMPORTED_SCHEDULE_OVERLAP" : "RESOURCE_TIME_OVERLAP",
+      `${resourceCode} overlaps ${first.source === "IMPORTED" ? "imported schedule" : "ERP reservation"} ${first.batch_no}.`,
+      { resourceCode, conflicts },
     );
   }
 }
@@ -114,11 +182,12 @@ export async function createScheduleReservation(client: PoolClient, model: Batch
     throw new ErpConflictError("BATCH_NOT_SCHEDULABLE", `Batch ${batch.batch_no} is ${batch.status} and cannot receive a new reservation.`);
   }
   if (norm(batch.status) !== "SCHEDULED") validateStatusTransition(model, batch.status, "SCHEDULED");
-  await assertNoExactResourceOverlap(client, resourceCode, input.startAt, input.endAt);
+  await assertNoResourceOverlap(client, resourceCode, input.startAt, input.endAt, null, input.batchId);
 
   const sourceType = input.sourceType || "MANUAL";
   const actor = input.actor?.trim() || "PUBLIC_UI";
-  const scheduleDate = input.startAt.slice(0, 10);
+  const timezoneOffsetMinutes = await plantTimezoneOffsetMinutes(client);
+  const scheduleDate = wallDateFromInstant(input.startAt, timezoneOffsetMinutes);
   const capacityUnits = Math.max(1, Math.round(Number(input.capacityUnits || 1)));
   const inserted = await client.query<{
     id: string; version: number;
@@ -139,7 +208,7 @@ export async function createScheduleReservation(client: PoolClient, model: Batch
     eventType:"SCHEDULE_RESERVED",entityType:"SCHEDULE_RESERVATION",entityId:inserted.rows[0].id,batchId:input.batchId,actor,
     oldState:{ batchStatus:batch.status,batchVersion:batch.version },
     newState:{ batchStatus:"SCHEDULED",batchVersion:nextVersion,resourceCode,startAt:input.startAt,endAt:input.endAt,phase:input.phase || "NORMAL" },
-    metadata:{ sourceType,baseResourceCode,capacityUnits },
+    metadata:{ sourceType,baseResourceCode,capacityUnits,scheduleDate,timezoneOffsetMinutes },
   });
   return { reservationId: inserted.rows[0].id, reservationVersion: inserted.rows[0].version, batchVersion: nextVersion, batchNo: batch.batch_no };
 }

@@ -19,6 +19,14 @@ export type ExecutionMutation = {
 const norm=(v:unknown)=>String(v??"").trim().toUpperCase();
 const isoNow=()=>new Date().toISOString();
 
+function resolveTimestamp(value?:string|null){
+  const raw=value?.trim();
+  if(!raw)return isoNow();
+  const parsed=new Date(raw);
+  if(!Number.isFinite(parsed.getTime()))throw new ErpConflictError("INVALID_ACTUAL_TIMESTAMP",`Invalid actual timestamp: ${raw}.`);
+  return parsed.toISOString();
+}
+
 async function lockBatch(client:PoolClient,batchId:string){
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",[`ST_BATCH_EXEC:${batchId}`]);
   const r=await client.query<{id:string;batch_no:string;status:string;version:number;actual_start:string|null;actual_end:string|null}>(`SELECT id::text,batch_no,status,version,actual_start::text,actual_end::text FROM planning_batches WHERE id=$1 FOR UPDATE`,[batchId]);
@@ -42,7 +50,7 @@ export async function mutateExecution(client:PoolClient,model:BatchModel,input:E
   const batch=await lockBatch(client,input.batchId);
   checkVersion(batch.version,input.expectedBatchVersion);
   const actor=input.actor?.trim()||"PUBLIC_UI";
-  const at=input.actualAt?.trim()||isoNow();
+  const at=resolveTimestamp(input.actualAt);
   const memberResult=await client.query<{
     id:string;job_num:string;main_operation_code:string;route_occurrence_key:string;route_position:number|null;qty:string|null;
   }>(`
@@ -53,15 +61,26 @@ export async function mutateExecution(client:PoolClient,model:BatchModel,input:E
     ORDER BY j.sequence_order,j.id`,[input.batchId,input.jobNum?.trim()||null]);
   if(!memberResult.rows.length)throw new Error(input.jobNum?`Job ${input.jobNum} is not a member of this Batch.`:"Batch has no Jobs.");
 
-  if(input.action==="START" && norm(batch.status)!=="STARTED")validateStatusTransition(model,batch.status,"STARTED");
-  if(input.action==="COMPLETE" && norm(batch.status)!=="STARTED" && norm(batch.status)!=="COMPLETED")throw new ErpConflictError("BATCH_NOT_STARTED",`Batch ${batch.batch_no} must be STARTED before completion.`);
-  if(input.action==="RESET" && ["COMPLETED","CANCELLED"].includes(norm(batch.status)))throw new ErpConflictError("TERMINAL_BATCH",`Batch ${batch.batch_no} is ${batch.status}; execution cannot be reset.`);
+  const batchStatus=norm(batch.status);
+  if(batchStatus==="CANCELLED")throw new ErpConflictError("TERMINAL_BATCH",`Batch ${batch.batch_no} is CANCELLED; actual execution cannot be changed.`);
+  if(input.action==="START" && batchStatus!=="STARTED")validateStatusTransition(model,batch.status,"STARTED");
+  if(input.action==="COMPLETE" && batchStatus!=="STARTED"){
+    if(batchStatus==="COMPLETED")throw new ErpConflictError("TERMINAL_BATCH",`Batch ${batch.batch_no} is COMPLETED; actual execution is locked. Use a controlled correction workflow instead of rewriting history.`);
+    throw new ErpConflictError("BATCH_NOT_STARTED",`Batch ${batch.batch_no} must be STARTED before completion.`);
+  }
+  if(input.action==="HOLD" && batchStatus!=="STARTED")throw new ErpConflictError("BATCH_NOT_STARTED",`Batch ${batch.batch_no} must be STARTED before a Job can be placed on HOLD.`);
+  if(input.action==="RESET" && batchStatus!=="STARTED")throw new ErpConflictError("BATCH_NOT_STARTED",`Batch ${batch.batch_no} must be STARTED before execution can be reset.`);
 
   const targetState=actionState(input.action);
   const ids:string[]=[];
   for(const member of memberResult.rows){
     const existing=await client.query<{id:string;state:string;actual_start:string|null;actual_end:string|null;version:number}>(`SELECT id::text,state,actual_start::text,actual_end::text,version FROM erp_job_operation_execution WHERE upper(btrim(job_num))=upper(btrim($1)) AND route_occurrence_key=$2 FOR UPDATE`,[member.job_num,member.route_occurrence_key]);
     const old=existing.rows[0]||null;
+    const oldState=norm(old?.state);
+    if(oldState==="DONE" && input.action!=="COMPLETE")throw new ErpConflictError("EXECUTION_DONE_LOCKED",`${member.job_num} / ${member.route_occurrence_key} is DONE and cannot be reopened by ${input.action}.`,{jobNum:member.job_num,routeOccurrenceKey:member.route_occurrence_key,state:old?.state});
+    if(input.action==="COMPLETE" && oldState==="DONE")throw new ErpConflictError("EXECUTION_DONE_LOCKED",`${member.job_num} / ${member.route_occurrence_key} is already DONE. Actual completion is locked.`,{jobNum:member.job_num,routeOccurrenceKey:member.route_occurrence_key,state:old?.state});
+    if(input.action==="HOLD" && oldState!=="IN_PROGRESS" && oldState!=="HOLD")throw new ErpConflictError("EXECUTION_NOT_IN_PROGRESS",`${member.job_num} / ${member.route_occurrence_key} must be IN_PROGRESS before HOLD.`,{jobNum:member.job_num,routeOccurrenceKey:member.route_occurrence_key,state:old?.state||"WAITING"});
+    if(input.action==="RESET" && oldState!=="IN_PROGRESS" && oldState!=="HOLD")throw new ErpConflictError("EXECUTION_NOT_RESETTABLE",`${member.job_num} / ${member.route_occurrence_key} can only reset from IN_PROGRESS or HOLD.`,{jobNum:member.job_num,routeOccurrenceKey:member.route_occurrence_key,state:old?.state||"WAITING"});
     let actualStart=old?.actual_start||null;
     let actualEnd=old?.actual_end||null;
     if(input.action==="START"){actualStart=actualStart||at;actualEnd=null;}
@@ -114,7 +133,7 @@ export async function upsertInspection(client:PoolClient,input:InspectionMutatio
   const current=await client.query<{id:string;status:string;actual_start:string|null;actual_end:string|null;version:number}>(`SELECT id::text,status,actual_start::text,actual_end::text,version FROM erp_inspection_events WHERE upper(btrim(job_num))=upper(btrim($1)) AND route_occurrence_key=$2 FOR UPDATE`,[input.jobNum,input.routeOccurrenceKey]);
   const old=current.rows[0]||null;
   if(old&&input.expectedVersion!=null&&old.version!==input.expectedVersion)throw new ErpConflictError("STALE_INSPECTION_VERSION","Inspection state changed after the screen was loaded.",{expectedVersion:input.expectedVersion,actualVersion:old.version});
-  const at=input.actualAt?.trim()||isoNow();
+  const at=resolveTimestamp(input.actualAt);
   let actualStart=old?.actual_start||null;let actualEnd=old?.actual_end||null;
   if(input.status==="IN_PROGRESS"){actualStart=actualStart||at;actualEnd=null;}
   if(["PASSED","FAILED","SKIPPED"].includes(input.status)){actualStart=actualStart||at;actualEnd=at;}

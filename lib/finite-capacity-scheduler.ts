@@ -92,6 +92,13 @@ export type ProposedCapacityBatch = {
   recipeName: string | null;
   jobCount: number;
   jobs: string[];
+  jobOccurrences: Array<{
+    jobNum: string;
+    planningJobId: number;
+    routeOccurrenceKey: string;
+    routePosition: number;
+    operationCode: string;
+  }>;
   totalQty: number;
   totalSurfaceDm2: number;
   durationMinutes: number;
@@ -1273,7 +1280,9 @@ function nodeToPublic(node:BatchNode):ProposedCapacityBatch{
   const dependencyJobs=[...new Set(node.dependencyBatches.flatMap(x=>x.jobs))];
   return{
     id:node.id,batchNo:node.batchNo,sourceKind:node.sourceKind,mainOperationCode:node.mainOperation.code,mainOperationLabel:node.mainOperation.label,batchKey:node.batchKey,
-    recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),totalQty:node.members.reduce((sum,x)=>sum+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((sum,x)=>sum+x.row.surfaceDm2,0),
+    recipeNo:node.recipeNo,recipeName:node.recipeName,jobCount:node.members.length,jobs:node.members.map(x=>x.row.jobNum),
+    jobOccurrences:node.members.map(x=>({jobNum:x.row.jobNum,planningJobId:x.row.planningJobId,routeOccurrenceKey:x.step.routeOccurrenceKey,routePosition:x.step.routePosition,operationCode:x.step.operationCode})),
+    totalQty:node.members.reduce((sum,x)=>sum+n(x.row.qty),0),totalSurfaceDm2:node.members.reduce((sum,x)=>sum+x.row.surfaceDm2,0),
     durationMinutes:node.durationMinutes,batchRuleCode:node.ruleCode,resourceBase:node.resourceBase,resourceInstance:node.resourceInstance,startAt:wallIso(node.start),endAt:wallIso(node.end),mustStartBy:wallIso(node.mustStartBy),
     batchReadyAt:wallIso(node.batchReadyAt),prerequisiteManualBatchCount:node.prerequisiteManualBatches.length,prerequisiteManualJobCount:prerequisiteJobs.length,prerequisiteManualLoadMinutes:node.prerequisiteManualLoadMinutes,prerequisiteManualCompleteAt:wallIso(node.prerequisiteManualCompleteAt),
     prerequisiteManualBatches:node.prerequisiteManualBatches.map(x=>({batchNo:x.batchNo,mainOperationCode:x.mainOperationCode,operationCodes:x.operationCodes,jobs:x.jobs,loadMinutes:x.loadMinutes,elapsedMinutes:x.start!=null&&x.end!=null?Math.max(0,Math.round((x.end-x.start)/60_000)):null,startAt:wallIso(x.start),endAt:wallIso(x.end)})),

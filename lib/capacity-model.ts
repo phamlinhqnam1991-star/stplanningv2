@@ -412,3 +412,64 @@ export function capacityInstanceCodes(def: CapacityResourceDefinition): string[]
   if (def.instanceCount <= 1) return [def.baseResourceCode];
   return Array.from({ length: def.instanceCount }, (_, i) => `${def.instancePrefix}${i + 1}`);
 }
+
+export function capacityDefinitionForInstance(
+  model: CapacityModel,
+  resourceCode: string | null | undefined,
+): CapacityResourceDefinition | null {
+  const wanted = key(resourceCode);
+  if (!wanted) return null;
+  for (const def of model.resourceList) {
+    if (!def.enabled) continue;
+    if (capacityInstanceCodes(def).some((instance) => key(instance) === wanted)) return def;
+  }
+  return null;
+}
+
+function hhmmMinutes(value: string | null | undefined): number | null {
+  const match = String(value ?? "").trim().match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+/**
+ * True when the whole UTC instant interval fits inside one configured resource
+ * calendar window in plant wall-clock time. CONTINUOUS_24H always passes.
+ */
+export function capacityWindowAllows(
+  def: CapacityResourceDefinition,
+  startAt: string,
+  endAt: string,
+  timezoneOffsetMinutes: number,
+): boolean {
+  if (def.calendarMode !== "WINDOW") return true;
+  const windowStart = hhmmMinutes(def.windowStart);
+  const windowEnd = hhmmMinutes(def.windowEnd);
+  if (windowStart == null || windowEnd == null) return false;
+
+  const startMs = new Date(startAt).getTime();
+  const endMs = new Date(endAt).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return false;
+  const offsetMs = timezoneOffsetMinutes * 60_000;
+  const localStart = startMs + offsetMs;
+  const localEnd = endMs + offsetMs;
+  const d = new Date(localStart);
+  const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+
+  // An overnight window (e.g. 22:00→06:00) can begin on the previous day.
+  for (const baseDay of [dayStart - 86_400_000, dayStart]) {
+    const windowStartMs = baseDay + windowStart * 60_000;
+    const windowEndMs = baseDay + windowEnd * 60_000 + (windowEnd <= windowStart ? 86_400_000 : 0);
+    if (localStart >= windowStartMs && localEnd <= windowEndMs) return true;
+  }
+  return false;
+}
+
+export function capacityWindowLabel(def: CapacityResourceDefinition): string {
+  return def.calendarMode === "WINDOW"
+    ? `${def.windowStart || "?"}–${def.windowEnd || "?"}`
+    : "24H";
+}

@@ -21,7 +21,16 @@ import {
   writeAuditEvent,
   type CommitmentTarget,
 } from "@/lib/commitment-ledger";
-import { createScheduleReservation } from "@/lib/scheduling-ledger";
+import { createScheduleReservation, findResourceReservationConflicts } from "@/lib/scheduling-ledger";
+import {
+  capacityDefinitionForInstance,
+  capacityWindowAllows,
+  capacityWindowLabel,
+  getCapacityModel,
+  type CapacityModel,
+} from "@/lib/capacity-model";
+import { getStOutputModel } from "@/lib/st-output-model";
+import { compactDate, ddMonFromWallDate, plantToday, wallDateFromInstant } from "@/lib/plant-time";
 import { currentPlanningJobsSource } from "@/lib/current-job-read-model";
 
 export type ProposalConflictCode =
@@ -51,43 +60,47 @@ const norm = (v: unknown) => String(v ?? "").trim().toUpperCase();
 function safePrefix(value: string) {
   return value.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "BAT";
 }
-function ddMon(date: Date) {
-  const mon = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"][date.getUTCMonth()];
-  return `${String(date.getUTCDate()).padStart(2, "0")}${mon}`;
-}
-function yyyymmdd(date: Date) {
-  return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, "0")}${String(date.getUTCDate()).padStart(2, "0")}`;
-}
-function renderBatchNo(pattern: string, prefix: string, main: string, seq: number, date: Date) {
+function renderBatchNo(pattern: string, prefix: string, main: string, seq: number, wallDate: string) {
   return pattern
     .replaceAll("{SHORT}", prefix)
     .replaceAll("{MAIN}", safePrefix(main))
-    .replaceAll("{YYYYMMDD}", yyyymmdd(date))
-    .replaceAll("{DDMMM}", ddMon(date))
+    .replaceAll("{YYYYMMDD}", compactDate(wallDate))
+    .replaceAll("{DDMMM}", ddMonFromWallDate(wallDate))
     .replaceAll("{SEQ3}", String(seq).padStart(3, "0"))
     .replaceAll("{SEQ4}", String(seq).padStart(4, "0"));
 }
 
-async function lockProposalNumbering(client: PoolClient) {
+async function lockProposalNumbering(client: PoolClient, wallDate: string) {
   await client.query(
-    "SELECT pg_advisory_xact_lock(hashtextextended('ST_PROPOSAL_NUMBERING:'||CURRENT_DATE::text,0))",
+    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+    [`ST_PROPOSAL_NUMBERING:${wallDate}`],
   );
 }
-async function nextProposalNo(client: PoolClient) {
+async function nextProposalNo(client: PoolClient, wallDate: string) {
+  const prefix = `PROP_${compactDate(wallDate)}_`;
   const r = await client.query<{ n: string }>(
-    `SELECT 'PROP_'||to_char(CURRENT_DATE,'YYYYMMDD')||'_'||lpad((count(*)+1)::text,3,'0') AS n
+    `SELECT $1||lpad((COALESCE(MAX(
+             CASE WHEN substring(proposal_no from char_length($1)+1) ~ '^[0-9]+$'
+                  THEN substring(proposal_no from char_length($1)+1)::int END
+           ),0)+1)::text,3,'0') AS n
        FROM planning_proposed_plan
-      WHERE created_at::date=CURRENT_DATE`,
+      WHERE proposal_no LIKE $1||'%'`,
+    [prefix],
   );
-  return r.rows[0]?.n || `PROP_${Date.now()}`;
+  return r.rows[0]?.n || `${prefix}${Date.now()}`;
 }
-async function nextSnapshotNo(client: PoolClient) {
+async function nextSnapshotNo(client: PoolClient, wallDate: string) {
+  const prefix = `SNAP_${compactDate(wallDate)}_`;
   const r = await client.query<{ n: string }>(
-    `SELECT 'SNAP_'||to_char(CURRENT_DATE,'YYYYMMDD')||'_'||lpad((count(*)+1)::text,3,'0') AS n
+    `SELECT $1||lpad((COALESCE(MAX(
+             CASE WHEN substring(snapshot_no from char_length($1)+1) ~ '^[0-9]+$'
+                  THEN substring(snapshot_no from char_length($1)+1)::int END
+           ),0)+1)::text,3,'0') AS n
        FROM planning_production_snapshot
-      WHERE created_at::date=CURRENT_DATE`,
+      WHERE snapshot_no LIKE $1||'%'`,
+    [prefix],
   );
-  return r.rows[0]?.n || `SNAP_${Date.now()}`;
+  return r.rows[0]?.n || `${prefix}${Date.now()}`;
 }
 
 function routeOccurrenceForJob(
@@ -123,7 +136,7 @@ export async function createProposedPlan(
 ) {
   // Simulation remains read-only. Proposal persistence starts only after both
   // finite-capacity and canonical output projections have completed.
-  const [capacity, output] = await Promise.all([
+  const [capacity, output, outputModel] = await Promise.all([
     calculateFiniteCapacityTarget(
       {
         targetDate: input.targetDate,
@@ -137,12 +150,14 @@ export async function createProposedPlan(
       cutoffTime: input.cutoffTime,
       targetValue: input.targetValue,
     }),
+    getStOutputModel(),
   ]);
+  const numberingDate = plantToday(outputModel.timezoneOffsetMinutes);
 
   return withTransaction(async (client) => {
-    await lockProposalNumbering(client);
-    const snapshotNo = await nextSnapshotNo(client);
-    const proposalNo = await nextProposalNo(client);
+    await lockProposalNumbering(client, numberingDate);
+    const snapshotNo = await nextSnapshotNo(client, numberingDate);
+    const proposalNo = await nextProposalNo(client, numberingDate);
     const snapshot = await client.query<{ id: string }>(
       `INSERT INTO planning_production_snapshot(
          snapshot_no,horizon_start,horizon_end,source_hash,snapshot_json,summary_json
@@ -218,7 +233,7 @@ export async function createProposedPlan(
           b.recipeNo,
           b.recipeName,
           b.batchKey,
-          b.resourceBase || "FINITE_RESOURCE",
+          "FINITE_RESOURCE",
           b.resourceInstance || b.resourceBase,
           b.startAt,
           b.endAt,
@@ -233,7 +248,16 @@ export async function createProposedPlan(
 
       for (let i = 0; i < b.jobs.length; i += 1) {
         const job = b.jobs[i];
-        const route = routeOccurrenceForJob(output.rows, job, b.mainOperationCode);
+        const exactOccurrence = b.jobOccurrences?.[i] || null;
+        const route = exactOccurrence
+          ? {
+              planningJobId: exactOccurrence.planningJobId,
+              routePosition: exactOccurrence.routePosition,
+              routeOccurrenceKey: exactOccurrence.routeOccurrenceKey,
+              operationCode: exactOccurrence.operationCode,
+              recipeNo: b.recipeNo,
+            }
+          : routeOccurrenceForJob(output.rows, job, b.mainOperationCode);
         const jobResult = capacity.jobs.find((x) => norm(x.jobNum) === norm(job));
         await client.query(
           `INSERT INTO planning_proposed_batch_job(
@@ -281,43 +305,30 @@ async function resourceConflicts(
   endAt: string,
   excludeBatchId?: string | null,
 ) {
-  const r = await client.query<{
-    id: string;
-    batch_no: string;
-    start_at: string;
-    end_at: string;
-  }>(
-    `SELECT id::text,batch_no,start_at::text,end_at::text
-       FROM erp_schedule_reservations
-      WHERE state='ACTIVE'
-        AND upper(btrim(resource_code))=upper(btrim($1))
-        AND start_at<$3::timestamptz
-        AND end_at>$2::timestamptz
-        AND ($4::uuid IS NULL OR batch_id<>$4::uuid)
-      ORDER BY start_at
-      LIMIT 20`,
-    [resourceCode, startAt, endAt, excludeBatchId || null],
-  );
-  return r.rows;
+  return findResourceReservationConflicts(client, resourceCode, startAt, endAt, {
+    excludeBatchId: excludeBatchId || null,
+  });
 }
 
-async function loadLiveOutputForProposal(proposalId: number): Promise<LiveOutputMap> {
-  const meta = await query<{
-    target_date: string;
-    cutoff_time_text: string;
-    target_dm2: string;
-  }>(
-    `SELECT to_char(cutoff_time AT TIME ZONE 'UTC','YYYY-MM-DD') AS target_date,
-            to_char(cutoff_time AT TIME ZONE 'UTC','HH24:MI') AS cutoff_time_text,
-            target_dm2::text
+async function loadLiveOutputForProposal(
+  proposalId: number,
+  timezoneOffsetMinutes: number,
+): Promise<LiveOutputMap> {
+  const meta = await query<{ cutoff_time: string; target_dm2: string }>(
+    `SELECT cutoff_time::text,target_dm2::text
        FROM planning_proposed_plan
       WHERE id=$1`,
     [proposalId],
   );
   if (!meta.rows[0]) throw new Error("Proposed Plan not found.");
+  const cutoffMs = new Date(meta.rows[0].cutoff_time).getTime();
+  if (!Number.isFinite(cutoffMs)) throw new Error("Proposed Plan cutoff_time is invalid.");
+  const targetDate = wallDateFromInstant(cutoffMs, timezoneOffsetMinutes);
+  const shifted = new Date(cutoffMs + timezoneOffsetMinutes * 60_000).toISOString();
+  const cutoffTime = shifted.slice(11, 16);
   const output = await calculateStOutputTarget({
-    targetDate: meta.rows[0].target_date,
-    cutoffTime: meta.rows[0].cutoff_time_text,
+    targetDate,
+    cutoffTime,
     targetValue: Number(meta.rows[0].target_dm2 || 0),
   });
   return new Map(output.rows.map((row) => [norm(row.jobNum), row]));
@@ -410,6 +421,8 @@ async function revalidateProposalTx(
   proposalId: number,
   writeState: boolean,
   liveOutput: LiveOutputMap,
+  capacityModel: CapacityModel,
+  timezoneOffsetMinutes: number,
   selectedOnly = false,
 ) {
   const plan = await client.query<{ id: string; status: string; version: number }>(
@@ -451,6 +464,24 @@ async function revalidateProposalTx(
         detail: "Proposal has no finite resource or start/end time.",
       });
       continue;
+    }
+    const resourceDef = capacityDefinitionForInstance(capacityModel, resource);
+    if (!resourceDef) {
+      conflicts.push({
+        code: "RESOURCE_CHANGED",
+        proposedBatchId: id,
+        batchNo,
+        detail: `${resource} is no longer an enabled Capacity Resource instance.`,
+      });
+      continue;
+    }
+    if (!capacityWindowAllows(resourceDef, start, end, timezoneOffsetMinutes)) {
+      conflicts.push({
+        code: "RESOURCE_CHANGED",
+        proposedBatchId: id,
+        batchNo,
+        detail: `${resource} is outside its current calendar window ${capacityWindowLabel(resourceDef)}.`,
+      });
     }
 
     if (String(raw.source_mode) === "EXISTING_UNSCHEDULED") {
@@ -538,7 +569,7 @@ async function revalidateProposalTx(
         code: "TIME_OVERLAP",
         proposedBatchId: id,
         batchNo,
-        detail: `${resource} overlaps ${c.batch_no} (${c.start_at} → ${c.end_at}).`,
+        detail: `${resource} overlaps ${c.source === "IMPORTED" ? "imported schedule" : "ERP reservation"} ${c.batch_no} (${c.start_at} → ${c.end_at}).`,
       });
     }
   }
@@ -587,9 +618,21 @@ export async function revalidateProposedPlan(
   proposalId: number,
   selectedOnly = false,
 ) {
-  const liveOutput = await loadLiveOutputForProposal(proposalId);
+  const [capacityModel, outputModel] = await Promise.all([
+    getCapacityModel(),
+    getStOutputModel(),
+  ]);
+  const liveOutput = await loadLiveOutputForProposal(proposalId, outputModel.timezoneOffsetMinutes);
   return withTransaction((client) =>
-    revalidateProposalTx(client, proposalId, true, liveOutput, selectedOnly),
+    revalidateProposalTx(
+      client,
+      proposalId,
+      true,
+      liveOutput,
+      capacityModel,
+      outputModel.timezoneOffsetMinutes,
+      selectedOnly,
+    ),
   );
 }
 
@@ -631,6 +674,7 @@ async function createRealBatchFromProposal(
   raw: Record<string, unknown>,
   jobs: Array<Record<string, unknown>>,
   actor: string,
+  numberingDate: string,
 ) {
   const main = String(raw.main_operation);
   const jobNums = jobs.map((j) => String(j.job_num));
@@ -664,18 +708,18 @@ async function createRealBatchFromProposal(
   const prefix = safePrefix(main.slice(0, 3));
   const seq = await client.query<{ last_sequence: number }>(
     `INSERT INTO batch_number_sequences(sequence_date,prefix,last_sequence)
-     VALUES(CURRENT_DATE,$1,1)
+     VALUES($2::date,$1,1)
      ON CONFLICT(sequence_date,prefix)
      DO UPDATE SET last_sequence=batch_number_sequences.last_sequence+1
      RETURNING last_sequence`,
-    [prefix],
+    [prefix, numberingDate],
   );
   const batchNo = renderBatchNo(
     pattern,
     prefix,
     main,
     Number(seq.rows[0]?.last_sequence || 1),
-    new Date(),
+    numberingDate,
   );
   const batch = await client.query<{ id: string; version: number }>(
     `INSERT INTO planning_batches(
@@ -774,10 +818,13 @@ export async function acceptProposedPlan(
   // Expensive route/recipe resolution is performed before opening the write
   // transaction. The transaction then revalidates commitments, versions and
   // exact resource occupancy again under locks before writing anything.
-  const [model, liveOutput] = await Promise.all([
+  const [model, capacityModel, outputModel] = await Promise.all([
     getBatchModel(),
-    loadLiveOutputForProposal(proposalId),
+    getCapacityModel(),
+    getStOutputModel(),
   ]);
+  const liveOutput = await loadLiveOutputForProposal(proposalId, outputModel.timezoneOffsetMinutes);
+  const numberingDate = plantToday(outputModel.timezoneOffsetMinutes);
   const selectedOnly = mode === "SELECTED";
 
   return withTransaction(async (client) => {
@@ -786,6 +833,8 @@ export async function acceptProposedPlan(
       proposalId,
       false,
       liveOutput,
+      capacityModel,
+      outputModel.timezoneOffsetMinutes,
       selectedOnly,
     );
     if (check.conflicts.length) {
@@ -816,14 +865,16 @@ export async function acceptProposedPlan(
           batchVersion: Number(raw.live_batch_version),
         };
       } else {
-        real = await createRealBatchFromProposal(client, model, raw, jobs, actor);
+        real = await createRealBatchFromProposal(client, model, raw, jobs, actor, numberingDate);
       }
+      const resourceDef = capacityDefinitionForInstance(capacityModel, String(raw.resource_code));
+      if (!resourceDef) throw new Error(`Proposal resource ${raw.resource_code} is no longer configured.`);
       const reservation = await createScheduleReservation(client, model, {
         batchId: real.batchId,
         expectedBatchVersion: real.batchVersion,
-        baseResourceCode: String(raw.resource_type || raw.resource_code),
+        baseResourceCode: resourceDef.baseResourceCode,
         resourceCode: String(raw.resource_code),
-        resourceType: String(raw.resource_type || "FINITE_RESOURCE"),
+        resourceType: "FINITE_RESOURCE",
         phase: "NORMAL",
         startAt: String(raw.start_time),
         endAt: String(raw.end_time),

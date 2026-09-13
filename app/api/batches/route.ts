@@ -3,6 +3,8 @@ import { z } from "zod";
 import { query, withTransaction } from "@/lib/db";
 import { aggregateProcessTime, batchNumberPattern, getBatchModel } from "@/lib/batch-model";
 import { loadCandidateRows } from "@/lib/candidate-service";
+import { getStOutputModel } from "@/lib/st-output-model";
+import { compactDate, ddMonFromWallDate, plantToday } from "@/lib/plant-time";
 import {
   ErpConflictError,
   acquireCommitmentLocks,
@@ -43,17 +45,12 @@ const deleteSchema = z.object({
 
 function boolSetting(value: unknown, fallback: boolean) { return typeof value === "boolean" ? value : fallback; }
 function safePrefix(value: string) { return value.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "BAT"; }
-function ddMon(date: Date) {
-  const mon = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"][date.getUTCMonth()];
-  return `${String(date.getUTCDate()).padStart(2,"0")}${mon}`;
-}
-function yyyymmdd(date: Date) { return `${date.getUTCFullYear()}${String(date.getUTCMonth()+1).padStart(2,"0")}${String(date.getUTCDate()).padStart(2,"0")}`; }
-function renderBatchNo(pattern: string, prefix: string, main: string, seq: number, date: Date) {
+function renderBatchNo(pattern: string, prefix: string, main: string, seq: number, wallDate: string) {
   return pattern
     .replaceAll("{SHORT}", prefix)
     .replaceAll("{MAIN}", safePrefix(main))
-    .replaceAll("{YYYYMMDD}", yyyymmdd(date))
-    .replaceAll("{DDMMM}", ddMon(date))
+    .replaceAll("{YYYYMMDD}", compactDate(wallDate))
+    .replaceAll("{DDMMM}", ddMonFromWallDate(wallDate))
     .replaceAll("{SEQ3}", String(seq).padStart(3,"0"))
     .replaceAll("{SEQ4}", String(seq).padStart(4,"0"));
 }
@@ -141,6 +138,49 @@ export async function POST(request: Request) {
         validateStatusTransition(model, current.status, x.status);
         if (current.status === x.status) return { version:current.version, status:current.status };
 
+        const [reservationState, executionState] = await Promise.all([
+          client.query<{ active_count:number }>(
+            `SELECT count(*)::int AS active_count FROM erp_schedule_reservations WHERE batch_id=$1 AND state='ACTIVE'`,
+            [x.batchId],
+          ),
+          client.query<{ total_jobs:number; done_jobs:number; active_execution:number }>(`
+            SELECT count(*)::int AS total_jobs,
+                   count(*) FILTER(WHERE e.state='DONE')::int AS done_jobs,
+                   count(*) FILTER(WHERE e.state IN ('IN_PROGRESS','HOLD'))::int AS active_execution
+              FROM planning_batch_jobs j
+              LEFT JOIN erp_job_operation_execution e
+                ON upper(btrim(e.job_num))=upper(btrim(j.job_num))
+               AND e.route_occurrence_key=COALESCE(NULLIF(j.route_occurrence_key,''),'LEGACY:'||j.id::text)
+             WHERE j.batch_id=$1`,
+            [x.batchId],
+          ),
+        ]);
+        const activeReservations = Number(reservationState.rows[0]?.active_count || 0);
+        const totalJobs = Number(executionState.rows[0]?.total_jobs || 0);
+        const doneJobs = Number(executionState.rows[0]?.done_jobs || 0);
+        const activeExecution = Number(executionState.rows[0]?.active_execution || 0);
+        const targetStatus = x.status.trim().toUpperCase();
+        const currentStatus = current.status.trim().toUpperCase();
+
+        if (targetStatus === 'SCHEDULED' && activeReservations === 0) {
+          throw new ErpConflictError('SCHEDULE_RESERVATION_REQUIRED', 'Use SCH-20 Transactional Scheduling to move a Batch to SCHEDULED.', { batchId:x.batchId });
+        }
+        if (['DRAFT','READY'].includes(targetStatus) && activeReservations > 0) {
+          throw new ErpConflictError('ACTIVE_RESERVATION_EXISTS', 'Cancel the active ERP reservation in SCH-20 before moving this Batch back to READY/DRAFT.', { batchId:x.batchId,activeReservations });
+        }
+        if (targetStatus === 'STARTED') {
+          throw new ErpConflictError('EXECUTION_LEDGER_REQUIRED', 'Use EXEC-25 Start so Job-level actual execution and Batch status advance in the same transaction.', { batchId:x.batchId });
+        }
+        if (targetStatus === 'COMPLETED' && (totalJobs === 0 || doneJobs !== totalJobs)) {
+          throw new ErpConflictError('EXECUTION_INCOMPLETE', `Batch cannot complete: ${doneJobs}/${totalJobs} Job occurrences are DONE. Use EXEC-25.`, { batchId:x.batchId,totalJobs,doneJobs });
+        }
+        if (targetStatus === 'CANCELLED' && activeExecution > 0) {
+          throw new ErpConflictError('EXECUTION_ACTIVE', 'Batch has IN_PROGRESS/HOLD execution. Resolve or reset actual execution before cancelling the Batch.', { batchId:x.batchId,activeExecution });
+        }
+        if (currentStatus === 'STARTED' && activeExecution > 0 && !['COMPLETED','CANCELLED'].includes(targetStatus)) {
+          throw new ErpConflictError('EXECUTION_ACTIVE', 'Batch has active execution and cannot be rolled back while work is IN_PROGRESS/HOLD.', { batchId:x.batchId,activeExecution });
+        }
+
         const members = await client.query<{job_num:string;main_operation_code:string}>(`
           SELECT j.job_num,COALESCE(j.main_operation_code,b.main_operation_code) AS main_operation_code
           FROM planning_batch_jobs j JOIN planning_batches b ON b.id=j.batch_id WHERE j.batch_id=$1`, [x.batchId]);
@@ -160,11 +200,23 @@ export async function POST(request: Request) {
            RETURNING version,status`, [x.batchId,x.status]);
         const commitmentState = commitmentStateForBatchStatus(model, x.status);
         await updateBatchCommitmentsForStatus(client, x.batchId, commitmentState);
+        if (targetStatus === 'CANCELLED') {
+          await client.query(`
+            UPDATE erp_schedule_reservations
+               SET state='CANCELLED',version=version+1,updated_at=now(),
+                   metadata=metadata||jsonb_build_object('cancelReason',$2,'cancelSource','BATCH_STATUS')
+             WHERE batch_id=$1 AND state='ACTIVE'`, [x.batchId,x.reason || null]);
+        } else if (targetStatus === 'COMPLETED') {
+          await client.query(`
+            UPDATE erp_schedule_reservations
+               SET state='COMPLETED',version=version+1,updated_at=now()
+             WHERE batch_id=$1 AND state='ACTIVE'`, [x.batchId]);
+        }
         await writeAuditEvent(client, {
           eventType:"BATCH_STATUS_CHANGED", entityType:"BATCH", entityId:x.batchId, batchId:x.batchId, actor,
           oldState:{ status:current.status, version:current.version },
           newState:{ status:x.status, version:updated.rows[0].version, commitmentState },
-          metadata:{ batchNo:current.batch_no, reason:x.reason || null },
+          metadata:{ batchNo:current.batch_no, reason:x.reason || null, activeReservations, totalJobs, doneJobs, activeExecution },
         });
         return updated.rows[0];
       });
@@ -188,6 +240,14 @@ export async function POST(request: Request) {
         }
         const statusConfig = model.statuses.find((status) => status.code === current.status);
         if (!statusConfig || statusConfig.data.allowDelete !== true) throw new Error(`Batch status ${current.status || "UNKNOWN"} does not allow deletion.`);
+        const [reservationUsage, executionHistory] = await Promise.all([
+          client.query<{active_count:number}>(`SELECT count(*)::int AS active_count FROM erp_schedule_reservations WHERE batch_id=$1 AND state='ACTIVE'`,[x.batchId]),
+          client.query<{history_count:number}>(`SELECT count(*)::int AS history_count FROM erp_job_operation_execution WHERE batch_id=$1`,[x.batchId]),
+        ]);
+        const activeReservations=Number(reservationUsage.rows[0]?.active_count||0);
+        const executionRows=Number(executionHistory.rows[0]?.history_count||0);
+        if(activeReservations>0)throw new ErpConflictError("ACTIVE_RESERVATION_EXISTS",`Batch ${current.batch_no} still has ${activeReservations} ACTIVE ERP reservation(s). Cancel them in SCH-20 before deleting.`,{batchId:x.batchId,activeReservations});
+        if(executionRows>0)throw new ErpConflictError("EXECUTION_HISTORY_EXISTS",`Batch ${current.batch_no} has ${executionRows} actual execution record(s) and cannot be deleted. Keep the Batch for ERP traceability.`,{batchId:x.batchId,executionRows});
         const members = await client.query<{job_num:string}>(`SELECT job_num FROM planning_batch_jobs WHERE batch_id=$1 ORDER BY sequence_order`, [x.batchId]);
         await writeAuditEvent(client, {
           eventType:"BATCH_DELETED", entityType:"BATCH", entityId:x.batchId, batchId:x.batchId, actor,
@@ -201,9 +261,10 @@ export async function POST(request: Request) {
     }
 
     const x = createSchema.parse(raw);
-    const [candidates, model] = await Promise.all([
+    const [candidates, model, outputModel] = await Promise.all([
       loadCandidateRows({ planningJobIds:x.planningJobIds, eligibleOnly:false, scanLimit:x.planningJobIds.length }),
       getBatchModel(),
+      getStOutputModel(),
     ]);
     if (candidates.length !== x.planningJobIds.length) throw new Error(`Only ${candidates.length}/${x.planningJobIds.length} selected jobs are available in the active Planning snapshot.`);
     const ineligible = candidates.filter((c)=>!c.batchProposal.eligible);
@@ -241,7 +302,7 @@ export async function POST(request: Request) {
     const prefix = safePrefix(main.shortCode || main.code.slice(0,3));
     const initialStatus = String(model.settings["batchModel.initialStatus"] || "DRAFT");
     if (model.statuses.length && !model.statuses.some((status) => status.code === initialStatus)) throw new Error(`Configured initial Batch Status ${initialStatus} is not enabled.`);
-    const today = new Date();
+    const today = plantToday(outputModel.timezoneOffsetMinutes);
     const actor = actorFromRequest(request, model.settings["batchModel.auditActorFallback"]);
     const initialCommitmentState=commitmentStateForBatchStatus(model,initialStatus);
     const targets: CommitmentTarget[] = candidates.map((candidate) => ({
@@ -265,9 +326,9 @@ export async function POST(request: Request) {
 
       const seqResult = await client.query<{ last_sequence:number }>(`
         INSERT INTO batch_number_sequences (sequence_date,prefix,last_sequence)
-        VALUES (CURRENT_DATE,$1,1)
+        VALUES ($2::date,$1,1)
         ON CONFLICT (sequence_date,prefix) DO UPDATE SET last_sequence=batch_number_sequences.last_sequence+1
-        RETURNING last_sequence`, [prefix]);
+        RETURNING last_sequence`, [prefix,today]);
       const seq = Number(seqResult.rows[0]?.last_sequence || 1);
       const batchNo = renderBatchNo(pattern,prefix,main.code,seq,today);
       const snapshot = {
